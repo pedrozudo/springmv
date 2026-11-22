@@ -29,6 +29,10 @@ PYBIND11_MODULE(_springmv, module)
             encapsulate(csr_spmv_unweighted_handler());
         registrations["springmv_csr_spmv_weighted"] =
             encapsulate(csr_spmv_weighted_handler());
+        registrations["springmv_csr_spmv_input_vjp"] =
+            encapsulate(csr_spmv_input_vjp_handler());
+        registrations["springmv_csr_spmv_values_vjp"] =
+            encapsulate(csr_spmv_values_vjp_handler());
         registrations["springmv_csr_logsumexp_unweighted"] =
             encapsulate(csr_logsumexp_unweighted_handler());
         registrations["springmv_csr_logsumexp_weighted"] =

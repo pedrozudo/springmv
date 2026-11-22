@@ -31,13 +31,15 @@ namespace cg = cooperative_groups;
  * - shuffle_down(tile, state, offset)
  * - finalize(state)
  */
-template <typename Policy, bool weighted, int subwarp_size>
+template <typename Policy, bool weighted, bool permuted, int subwarp_size>
 __global__ __launch_bounds__(block_size) void csr_reduce_kernel(
     std::int32_t num_rows, const std::int32_t* __restrict__ row_offsets,
     const std::int32_t* __restrict__ column_indices,
     const float* __restrict__ edge_values, const float* __restrict__ x,
-    float* __restrict__ y)
+    float* __restrict__ y,
+    const std::int32_t* __restrict__ edge_permutation)
 {
+    static_assert(!permuted || weighted);
     auto tile = cg::tiled_partition<subwarp_size>(cg::this_thread_block());
     const auto lane = static_cast<std::int32_t>(tile.thread_rank());
     auto row = initial_row<subwarp_size>();
@@ -50,7 +52,8 @@ __global__ __launch_bounds__(block_size) void csr_reduce_kernel(
              nz += subwarp_size) {
             const auto input = x[column_indices[nz]];
             if constexpr (weighted) {
-                state = Policy::accumulate_weighted(state, edge_values[nz],
+                const auto edge = permuted ? edge_permutation[nz] : nz;
+                state = Policy::accumulate_weighted(state, edge_values[edge],
                                                     input);
             } else {
                 state = Policy::accumulate_unweighted(state, input);
@@ -70,60 +73,70 @@ __global__ __launch_bounds__(block_size) void csr_reduce_kernel(
     }
 }
 
-template <typename Policy, bool weighted, int subwarp_size>
+template <typename Policy, bool weighted, bool permuted, int subwarp_size>
 cudaError_t launch_csr_reduce(
     std::int32_t num_rows, const std::int32_t* row_offsets,
     const std::int32_t* column_indices, const float* edge_values,
-    const float* x, float* y, cudaStream_t stream) noexcept
+    const float* x, float* y, cudaStream_t stream,
+    const std::int32_t* edge_permutation) noexcept
 {
     const auto grid = grid_size<subwarp_size>(num_rows);
-    csr_reduce_kernel<Policy, weighted, subwarp_size>
+    csr_reduce_kernel<Policy, weighted, permuted, subwarp_size>
         <<<grid, block_size, 0, stream>>>(num_rows, row_offsets,
-                                          column_indices, edge_values, x, y);
+                                          column_indices, edge_values, x, y,
+                                          edge_permutation);
     return cudaPeekAtLastError();
 }
 
-template <typename Policy, bool weighted>
+template <typename Policy, bool weighted, bool permuted = false>
 cudaError_t dispatch_csr_reduce(
     std::int32_t num_rows, const std::int32_t* row_offsets,
     const std::int32_t* column_indices, const float* edge_values,
     const float* x, float* y, CsrKernelOptions options,
-    cudaStream_t stream) noexcept
+    cudaStream_t stream,
+    const std::int32_t* edge_permutation = nullptr) noexcept
 {
     const auto subwarp = options.subwarp_size == 0
                              ? select_subwarp_size(options.max_nnz_per_row)
                              : options.subwarp_size;
     switch (subwarp) {
     case 1:
-        return launch_csr_reduce<Policy, weighted, 1>(
-            num_rows, row_offsets, column_indices, edge_values, x, y, stream);
+        return launch_csr_reduce<Policy, weighted, permuted, 1>(
+            num_rows, row_offsets, column_indices, edge_values, x, y, stream,
+            edge_permutation);
     case 2:
-        return launch_csr_reduce<Policy, weighted, 2>(
-            num_rows, row_offsets, column_indices, edge_values, x, y, stream);
+        return launch_csr_reduce<Policy, weighted, permuted, 2>(
+            num_rows, row_offsets, column_indices, edge_values, x, y, stream,
+            edge_permutation);
     case 4:
-        return launch_csr_reduce<Policy, weighted, 4>(
-            num_rows, row_offsets, column_indices, edge_values, x, y, stream);
+        return launch_csr_reduce<Policy, weighted, permuted, 4>(
+            num_rows, row_offsets, column_indices, edge_values, x, y, stream,
+            edge_permutation);
     case 8:
-        return launch_csr_reduce<Policy, weighted, 8>(
-            num_rows, row_offsets, column_indices, edge_values, x, y, stream);
+        return launch_csr_reduce<Policy, weighted, permuted, 8>(
+            num_rows, row_offsets, column_indices, edge_values, x, y, stream,
+            edge_permutation);
     case 16:
-        return launch_csr_reduce<Policy, weighted, 16>(
-            num_rows, row_offsets, column_indices, edge_values, x, y, stream);
+        return launch_csr_reduce<Policy, weighted, permuted, 16>(
+            num_rows, row_offsets, column_indices, edge_values, x, y, stream,
+            edge_permutation);
     case 32:
-        return launch_csr_reduce<Policy, weighted, 32>(
-            num_rows, row_offsets, column_indices, edge_values, x, y, stream);
+        return launch_csr_reduce<Policy, weighted, permuted, 32>(
+            num_rows, row_offsets, column_indices, edge_values, x, y, stream,
+            edge_permutation);
     default:
         return cudaErrorInvalidValue;
     }
 }
 
-template <typename Policy, bool weighted>
+template <typename Policy, bool weighted, bool permuted = false>
 cudaError_t csr_reduce(std::int32_t num_rows,
                        const std::int32_t* row_offsets,
                        const std::int32_t* column_indices,
                        const float* edge_values, const float* x, float* y,
                        CsrKernelOptions options,
-                       cudaStream_t stream) noexcept
+                       cudaStream_t stream,
+                       const std::int32_t* edge_permutation = nullptr) noexcept
 {
     if (num_rows < 0 || options.max_nnz_per_row < 0 ||
         !valid_subwarp_size(options.subwarp_size)) {
@@ -137,12 +150,13 @@ cudaError_t csr_reduce(std::int32_t num_rows,
     }
     if (options.max_nnz_per_row > 0 &&
         (column_indices == nullptr || x == nullptr ||
-         (weighted && edge_values == nullptr))) {
+         (weighted && edge_values == nullptr) ||
+         (permuted && edge_permutation == nullptr))) {
         return cudaErrorInvalidDevicePointer;
     }
-    return dispatch_csr_reduce<Policy, weighted>(
+    return dispatch_csr_reduce<Policy, weighted, permuted>(
         num_rows, row_offsets, column_indices, edge_values, x, y, options,
-        stream);
+        stream, edge_permutation);
 }
 
 }  // namespace springmv::detail

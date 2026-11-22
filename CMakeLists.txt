@@ -14,6 +14,7 @@ add_library(
     springmv
     src/csr_common.cpp
     src/csr_spmv.cu
+    src/csr_spmv_backward.cu
     src/csr_logsumexp.cu
     src/csr_tropical.cu
     src/csr_transpose.cu)
@@ -47,6 +48,17 @@ if(SPRINGMV_BUILD_TESTS)
     target_link_libraries(
         springmv_tests PRIVATE SpringMV::springmv CUDA::cudart CUDA::cusparse)
     add_test(NAME springmv.csr_spmv COMMAND springmv_tests)
+
+    add_executable(
+        springmv_spmv_backward_tests tests/test_csr_spmv_backward.cpp)
+    target_compile_features(
+        springmv_spmv_backward_tests PRIVATE cxx_std_17)
+    target_link_libraries(
+        springmv_spmv_backward_tests
+        PRIVATE SpringMV::springmv CUDA::cudart)
+    add_test(
+        NAME springmv.csr_spmv_backward
+        COMMAND springmv_spmv_backward_tests)
 
     add_executable(
         springmv_logsumexp_tests tests/test_csr_logsumexp.cpp)

@@ -18,7 +18,8 @@ Unweighted max-plus:   y[row] = max(x[column_indices[nz]])
 The current implementation intentionally supports only float32 values, int32
 CSR indices, and NVIDIA CUDA. It has no Ginkgo runtime dependency. A typed JAX
 FFI frontend exposes the same kernels without host copies and supports
-`jax.jit`.
+`jax.jit` plus first-order forward- and reverse-mode differentiation for
+arithmetic SpMV.
 
 Arithmetic, log-sum-exp, min-plus, and max-plus are compile-time policies over
 one internal CSR row-reduction engine. Scheduling, validation,
@@ -71,12 +72,22 @@ The tropical suite covers both semirings and weighting modes, empty-row
 identities, infinities, NaNs, duplicates, every subwarp width, zero-weight
 equivalence, permutation invariance, and min/max duality.
 
+The arithmetic backward suite checks weighted and unweighted input VJPs and
+edge-value VJPs for every subwarp width on a non-default CUDA stream. The JAX
+suite additionally covers JVP, VJP, `grad`, `value_and_grad`, JIT composition,
+dynamic `CsrStructure` arguments, duplicates, rectangular matrices, and empty
+structures.
+
 ## Benchmark
 
 ```bash
 ./build/springmv_benchmark
 ./build/springmv_benchmark --rows 1048576 --cols 1048576 \
   --nnz-per-row 32 --iterations 50 --warmup 10
+
+python benchmarks/benchmark_jax.py
+python benchmarks/benchmark_jax.py --rows 1048576 --cols 1048576 \
+  --nnz-per-row 16 --iterations 50 --warmup 10
 ```
 
 The benchmark uses CUDA events and reports weighted and unweighted arithmetic,
@@ -86,6 +97,11 @@ reports median, minimum, and maximum kernel times plus GNNZ/s and effective
 GB/s. Unweighted byte counts exclude edge values. Arithmetic operations also
 report GFLOP/s. Setup, validation, memory allocation, and transfers are outside
 the timed region.
+
+The JAX benchmark reports synchronized median, minimum, and maximum execution
+times for weighted forward execution, weighted and unweighted input VJPs, and
+the weighted value VJP. Structure construction and JIT compilation occur
+outside the timed region.
 
 ## Python and JAX API
 
@@ -153,6 +169,36 @@ compiled_result = compiled(log_x)
 Omitting the corresponding array dispatches to a distinct unweighted FFI
 target.
 
+Arithmetic SpMV supports first-order forward- and reverse-mode
+differentiation. The weighted form differentiates both `x` and `values`:
+
+```python
+from springmv import csr_spmv
+
+values = jnp.array([2.0, 3.0, 4.0], dtype=jnp.float32)
+x = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+
+primal, tangent = jax.jvp(
+    lambda current_values, current_x: csr_spmv(
+        structure, current_x, values=current_values
+    ),
+    (values, x),
+    (jnp.ones_like(values), jnp.ones_like(x)),
+)
+
+loss, (values_grad, x_grad) = jax.value_and_grad(
+    lambda current_values, current_x: csr_spmv(
+        structure, current_x, values=current_values
+    ).sum(),
+    argnums=(0, 1),
+)(values, x)
+```
+
+The input VJP uses the transpose stored in `CsrStructure`. Weighted input
+gradients read original values through `transpose_permutation`, without
+atomics or a reordered-value temporary. Higher-order differentiation is not
+currently supported.
+
 Values are deliberately not part of `CsrStructure`, so the same topology can
 be reused with changing or trainable weights. Calling `transpose()` returns a
 new structure using the already-precomputed transpose:
@@ -181,16 +227,18 @@ allocated.
 
 Current transformation support is deliberately narrow:
 
-| Operation | Eager | `jax.jit` | `jax.grad` | `jax.vmap` |
-|---|---:|---:|---:|---:|
-| Arithmetic and log CSR reductions | Yes | Yes | Not yet | Not yet |
-| Min-plus and max-plus reductions | Yes | Yes | No | Not yet |
-| CSR structure preprocessing | Yes | No | No | No |
+| Operation | Eager | `jax.jit` | `jax.jvp` | VJP/`jax.grad` | `jax.vmap` |
+|---|---:|---:|---:|---:|---:|
+| Arithmetic CSR reduction | Yes | Yes | Yes | Yes | No |
+| Log-sum-exp CSR reduction | Yes | Yes | Not yet | Not yet | No |
+| Min-plus and max-plus reductions | Yes | Yes | No | No | No |
+| CSR structure preprocessing | Yes | No | No | No | No |
 
 ## C++ API
 
 ```cpp
 #include <springmv/csr_spmv.hpp>
+#include <springmv/csr_spmv_backward.hpp>
 #include <springmv/csr_logsumexp.hpp>
 #include <springmv/csr_tropical.hpp>
 #include <springmv/csr_transpose.hpp>
@@ -223,6 +271,17 @@ springmv::csr_maxplus(num_rows, d_row_offsets, d_column_indices,
                       d_edge_values, d_x, d_max_y, options, stream);
 springmv::csr_maxplus(num_rows, d_row_offsets, d_column_indices,
                       d_x, d_max_y, options, stream);
+
+// Weighted input VJP. The transpose structure and permutation are reusable.
+springmv::csr_spmv_input_vjp(
+    num_cols, d_transposed_row_offsets, d_transposed_column_indices,
+    d_edge_permutation, d_values, d_output_cotangent,
+    d_input_cotangent, transpose_options, stream);
+
+// Per-edge weighted value VJP.
+springmv::csr_spmv_values_vjp(
+    num_rows, d_row_offsets, d_column_indices, d_x,
+    d_output_cotangent, d_values_cotangent, options, stream);
 ```
 
 All pointers are device pointers. Calls enqueue work on the supplied CUDA

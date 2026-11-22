@@ -36,6 +36,41 @@ def _reduction_call(target: str, num_rows: int) -> Callable[..., jax.Array]:
     )
 
 
+def _raw_reduction(
+    operation: str,
+    row_offsets: jax.Array,
+    column_indices: jax.Array,
+    x: jax.Array,
+    edge_values: jax.Array | None,
+    *,
+    num_rows: int,
+    max_nnz_per_row: int,
+    subwarp_size: int,
+) -> jax.Array:
+    max_row = np.int32(max_nnz_per_row)
+    subwarp = np.int32(subwarp_size)
+    suffix = "weighted" if edge_values is not None else "unweighted"
+    call = _reduction_call(
+        f"springmv_csr_{operation}_{suffix}", num_rows
+    )
+    if edge_values is None:
+        return call(
+            row_offsets,
+            column_indices,
+            x,
+            max_nnz_per_row=max_row,
+            subwarp_size=subwarp,
+        )
+    return call(
+        row_offsets,
+        column_indices,
+        edge_values,
+        x,
+        max_nnz_per_row=max_row,
+        subwarp_size=subwarp,
+    )
+
+
 def _reduce(
     operation: str,
     structure: CsrStructure,
@@ -51,15 +86,16 @@ def _reduce(
     if x_array.shape[0] != structure.num_cols:
         raise ValueError("x length must equal structure.num_cols")
 
-    max_row = np.int32(structure.max_nnz_per_row)
-    subwarp = _validate_subwarp_size(subwarp_size)
+    subwarp = int(_validate_subwarp_size(subwarp_size))
     if edge_values is None:
-        target = f"springmv_csr_{operation}_unweighted"
-        return _reduction_call(target, structure.num_rows)(
+        return _raw_reduction(
+            operation,
             structure.row_offsets,
             structure.column_indices,
             x_array,
-            max_nnz_per_row=max_row,
+            None,
+            num_rows=structure.num_rows,
+            max_nnz_per_row=structure.max_nnz_per_row,
             subwarp_size=subwarp,
         )
 
@@ -68,36 +104,15 @@ def _reduce(
         raise ValueError(
             f"{edge_values_name} and column_indices must have equal shapes"
         )
-    target = f"springmv_csr_{operation}_weighted"
-    return _reduction_call(target, structure.num_rows)(
+    return _raw_reduction(
+        operation,
         structure.row_offsets,
         structure.column_indices,
-        edge_values_array,
         x_array,
-        max_nnz_per_row=max_row,
+        edge_values_array,
+        num_rows=structure.num_rows,
+        max_nnz_per_row=structure.max_nnz_per_row,
         subwarp_size=subwarp,
-    )
-
-
-def csr_spmv(
-    structure: CsrStructure,
-    x: Any,
-    *,
-    values: Any | None = None,
-    subwarp_size: int = 0,
-) -> jax.Array:
-    """Compute an arithmetic float32/int32 CSR matrix-vector product.
-
-    Omitting ``values`` computes the unweighted row sums without storing or
-    reading an edge-value array. The structure owns static scheduling metadata.
-    """
-    return _reduce(
-        "spmv",
-        structure,
-        x,
-        values,
-        edge_values_name="values",
-        subwarp_size=subwarp_size,
     )
 
 

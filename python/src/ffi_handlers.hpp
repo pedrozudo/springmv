@@ -9,6 +9,8 @@ namespace springmv::jax_ffi {
 
 XLA_FFI_Handler* csr_spmv_unweighted_handler() noexcept;
 XLA_FFI_Handler* csr_spmv_weighted_handler() noexcept;
+XLA_FFI_Handler* csr_spmv_input_vjp_handler() noexcept;
+XLA_FFI_Handler* csr_spmv_values_vjp_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_unweighted_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_weighted_handler() noexcept;
 XLA_FFI_Handler* csr_minplus_unweighted_handler() noexcept;

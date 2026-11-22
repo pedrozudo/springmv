@@ -1,0 +1,38 @@
+[build-system]
+requires = [
+    "jax>=0.12.1",
+    "pybind11>=2.12",
+    "scikit-build-core>=0.10",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "springmv"
+version = "0.1.0"
+description = "CUDA sparse matrix-vector products over multiple semirings"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+dependencies = [
+    "jax>=0.12.1",
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+cuda13 = ["jax[cuda13]>=0.12.1"]
+test = ["pytest>=8"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build/{wheel_tag}"
+cmake.build-type = "Release"
+install.components = ["python"]
+wheel.packages = ["python/springmv"]
+
+[tool.scikit-build.cmake.define]
+SPRINGMV_BUILD_JAX = "ON"
+SPRINGMV_BUILD_TESTS = "OFF"
+SPRINGMV_BUILD_BENCHMARKS = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]

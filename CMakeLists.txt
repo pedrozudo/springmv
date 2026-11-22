@@ -6,6 +6,7 @@ include(GNUInstallDirs)
 
 option(SPRINGMV_BUILD_TESTS "Build SpringMV correctness tests" ON)
 option(SPRINGMV_BUILD_BENCHMARKS "Build SpringMV benchmarks" ON)
+option(SPRINGMV_BUILD_JAX "Build the SpringMV JAX extension" OFF)
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -85,12 +86,24 @@ install(
     TARGETS springmv
     EXPORT SpringMVTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        COMPONENT springmv_development
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        COMPONENT springmv_development
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+        COMPONENT springmv_development
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    COMPONENT springmv_development)
+install(
+    DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    COMPONENT springmv_development)
 install(
     EXPORT SpringMVTargets
     NAMESPACE SpringMV::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/SpringMV)
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/SpringMV
+    COMPONENT springmv_development)
+
+if(SPRINGMV_BUILD_JAX)
+    add_subdirectory(python)
+endif()
 

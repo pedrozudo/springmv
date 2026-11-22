@@ -16,8 +16,9 @@ Unweighted max-plus:   y[row] = max(x[column_indices[nz]])
 ```
 
 The current implementation intentionally supports only float32 values, int32
-CSR indices, and NVIDIA CUDA. It has no Ginkgo runtime dependency. Python and
-JAX are outside the current milestone.
+CSR indices, and NVIDIA CUDA. It has no Ginkgo runtime dependency. A typed JAX
+FFI frontend exposes the same kernels without host copies and supports
+`jax.jit`.
 
 Arithmetic, log-sum-exp, min-plus, and max-plus are compile-time policies over
 one internal CSR row-reduction engine. Scheduling, validation,
@@ -31,6 +32,9 @@ exposing templates in the public API.
 - NVIDIA CUDA Toolkit with cuSPARSE
 - A CUDA-capable NVIDIA GPU
 - Ninja (recommended, but not required)
+
+The Python package additionally requires Python 3.10 or newer and a
+CUDA-enabled JAX installation.
 
 ## Build and test
 
@@ -82,6 +86,106 @@ reports median, minimum, and maximum kernel times plus GNNZ/s and effective
 GB/s. Unweighted byte counts exclude edge values. Arithmetic operations also
 report GFLOP/s. Setup, validation, memory allocation, and transfers are outside
 the timed region.
+
+## Python and JAX API
+
+Create or activate a virtual environment with CUDA-enabled JAX, then install
+SpringMV from the repository root:
+
+```bash
+python -m pip install -e '.[test]'
+python -m pytest -q
+```
+
+If multiple CUDA toolkits are installed, select a coherent compiler and
+toolkit explicitly. For example:
+
+```bash
+CUDACXX=/usr/local/cuda/bin/nvcc \
+CMAKE_ARGS='-DCUDAToolkit_ROOT=/usr/local/cuda -DCMAKE_CUDA_ARCHITECTURES=native' \
+python -m pip install -e '.[test]'
+```
+
+The four sparse reductions share one immutable `CsrStructure`. Constructing it
+is an eager preprocessing step that validates the topology, builds its
+transpose, and computes static scheduling metadata:
+
+```python
+import jax
+import jax.numpy as jnp
+
+from springmv import CsrStructure, csr_logsumexp
+
+row_offsets = jnp.array([0, 2, 3], dtype=jnp.int32)
+column_indices = jnp.array([0, 2, 1], dtype=jnp.int32)
+log_values = jnp.array([0.2, -0.4, 0.7], dtype=jnp.float32)
+log_x = jnp.array([-1.0, -2.0, -3.0], dtype=jnp.float32)
+
+structure = CsrStructure.from_arrays(
+    row_offsets,
+    column_indices,
+    num_cols=log_x.shape[0],
+)
+
+weighted = csr_logsumexp(
+    structure,
+    log_x,
+    log_values=log_values,
+)
+
+# No dummy edge values are allocated or read by the unweighted target.
+unweighted = csr_logsumexp(
+    structure,
+    log_x,
+)
+
+compiled = jax.jit(
+    lambda x: csr_logsumexp(
+        structure,
+        x,
+    )
+)
+compiled_result = compiled(log_x)
+```
+
+`csr_spmv` accepts optional `values`, `csr_logsumexp` accepts optional
+`log_values`, and `csr_minplus`/`csr_maxplus` accept optional `edge_values`.
+Omitting the corresponding array dispatches to a distinct unweighted FFI
+target.
+
+Values are deliberately not part of `CsrStructure`, so the same topology can
+be reused with changing or trainable weights. Calling `transpose()` returns a
+new structure using the already-precomputed transpose:
+
+```python
+transposed_structure = structure.transpose()
+transposed_log_values = log_values[structure.transpose_permutation]
+```
+
+The transpose swaps dimensions and scheduling metadata and inverts the edge
+permutation. Constructing or transposing a structure is intentionally rejected
+inside JAX transformations. The lower-level `csr_transpose` array API remains
+available when only raw transposed arrays are required:
+
+```python
+from springmv import csr_transpose
+
+t_row_offsets, t_column_indices = csr_transpose(
+    row_offsets, column_indices, num_cols=3
+)
+```
+
+Supplying `values=` also returns transposed values. Temporary CUDA workspace is
+managed internally. When `return_permutation=False`, no permutation output is
+allocated.
+
+Current transformation support is deliberately narrow:
+
+| Operation | Eager | `jax.jit` | `jax.grad` | `jax.vmap` |
+|---|---:|---:|---:|---:|
+| Arithmetic and log CSR reductions | Yes | Yes | Not yet | Not yet |
+| Min-plus and max-plus reductions | Yes | Yes | No | Not yet |
+| CSR structure preprocessing | Yes | No | No | No |
 
 ## C++ API
 

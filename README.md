@@ -241,8 +241,9 @@ Unweighted input VJPs always use the transpose stored in `CsrStructure`.
 Weighted arithmetic and log-sum-exp operations retain two implementations for
 benchmarking. `input_vjp_strategy="transpose"` reads original values through
 `transpose_permutation`; `input_vjp_strategy="scatter"` traverses original CSR
-and atomically accumulates into the input cotangent. Transpose is currently the
-default while the strategies are evaluated across matrix distributions:
+and atomically accumulates into the input cotangent. Scatter is the default for
+weighted operations because it avoids indirect value reads. Transpose remains
+available for matrices where atomic contention makes it faster:
 
 ```python
 x_grad_scatter = jax.grad(

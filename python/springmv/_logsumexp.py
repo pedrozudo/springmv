@@ -552,7 +552,7 @@ def csr_logsumexp(
     *,
     log_values: Any | None = None,
     subwarp_size: int = 0,
-    input_vjp_strategy: str = "transpose",
+    input_vjp_strategy: str = "scatter",
 ) -> jax.Array:
     """Compute a first-order differentiable log-sum-exp CSR product.
 

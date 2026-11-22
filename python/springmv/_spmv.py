@@ -422,7 +422,7 @@ def csr_spmv(
     *,
     values: Any | None = None,
     subwarp_size: int = 0,
-    input_vjp_strategy: str = "transpose",
+    input_vjp_strategy: str = "scatter",
 ) -> jax.Array:
     """Compute a first-order differentiable arithmetic CSR product.
 

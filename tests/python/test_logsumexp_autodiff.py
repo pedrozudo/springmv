@@ -625,6 +625,35 @@ def test_vmap_grad_with_batched_values_and_inputs(
     np.testing.assert_allclose(actual[1], expected[1], rtol=8e-6, atol=1e-6)
 
 
+def test_grad_through_vmap_with_batched_values_and_shared_input(
+    structure: springmv.CsrStructure,
+) -> None:
+    values = jnp.stack((LOG_VALUES, LOG_VALUES + 0.2))
+
+    def spring_loss(current_x):
+        outputs = jax.vmap(
+            lambda current_values: springmv.csr_logsumexp(
+                structure,
+                current_x,
+                log_values=current_values,
+                input_vjp_strategy="scatter",
+            )
+        )(values)
+        return jnp.sum(outputs * OUTPUT_COTANGENT)
+
+    def reference_loss(current_x):
+        outputs = jax.vmap(
+            lambda current_values: _reference_logsumexp(
+                current_values, current_x
+            )
+        )(values)
+        return jnp.sum(outputs * OUTPUT_COTANGENT)
+
+    actual = jax.jit(jax.grad(spring_loss))(LOG_X)
+    expected = jax.grad(reference_loss)(LOG_X)
+    np.testing.assert_allclose(actual, expected, rtol=8e-6, atol=1e-6)
+
+
 def test_invalid_input_vjp_strategy(
     structure: springmv.CsrStructure,
 ) -> None:

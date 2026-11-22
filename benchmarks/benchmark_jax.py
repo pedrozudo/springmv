@@ -60,7 +60,7 @@ def _report_comparison(
     jax_median, jax_minimum, jax_maximum = jax_samples
     speedup = jax_median / springmv_median
     print(
-        f"{name:33s} "
+        f"{name:65s} "
         f"{springmv_label} {springmv_median:9.4f} "
         f"[{springmv_minimum:9.4f}, {springmv_maximum:9.4f}] ms  "
         f"{jax_label} {jax_median:9.4f} "
@@ -111,7 +111,10 @@ def main() -> None:
     parser.add_argument(
         "--diagnose-input-vjp",
         action="store_true",
-        help="compare permutation, reordered-value, and cuSPARSE VJP paths",
+        help=(
+            "compare scatter and transpose input-VJP strategies, including "
+            "value-reordering costs"
+        ),
     )
     args = parser.parse_args()
 
@@ -194,6 +197,14 @@ def main() -> None:
             indices_are_sorted=True,
         )
 
+    def jax_segment_spmv_unweighted(current_x):
+        return jax.ops.segment_sum(
+            current_x[structure.column_indices],
+            edge_rows,
+            num_segments=args.rows,
+            indices_are_sorted=True,
+        )
+
     def jax_segment_logsumexp(current_values, current_x):
         terms = current_values + current_x[structure.column_indices]
         row_max = jax.ops.segment_max(
@@ -226,287 +237,433 @@ def main() -> None:
         )
         return row_max + jnp.log(scaled_sum)
 
-    weighted_forward = jax.jit(
-        lambda current_values, current_x: springmv.csr_spmv(
+    def squared_output_loss(operation, *primals):
+        output = operation(*primals)
+        return 0.5 * jnp.sum(output * output)
+
+    def springmv_arithmetic_unweighted(current_x):
+        return springmv.csr_spmv(
+            structure,
+            current_x,
+            subwarp_size=args.subwarp_size,
+        )
+
+    def springmv_arithmetic_weighted(current_values, current_x):
+        return springmv.csr_spmv(
             structure,
             current_x,
             values=current_values,
             subwarp_size=args.subwarp_size,
+            input_vjp_strategy="scatter",
         )
-    )
-    unweighted_input_vjp = jax.jit(
-        lambda cotangent: jax.vjp(
-            lambda current_x: springmv.csr_spmv(
-                structure, current_x, subwarp_size=args.subwarp_size
-            ),
-            x,
-        )[1](cotangent)[0]
-    )
-    weighted_input_vjp = jax.jit(
-        lambda current_values, cotangent: jax.vjp(
-            lambda current_x: springmv.csr_spmv(
-                structure,
-                current_x,
-                values=current_values,
-                subwarp_size=args.subwarp_size,
-                input_vjp_strategy="transpose",
-            ),
-            x,
-        )[1](cotangent)[0]
-    )
-    weighted_input_vjp_scatter = jax.jit(
-        lambda current_values, cotangent: jax.vjp(
-            lambda current_x: springmv.csr_spmv(
-                structure,
-                current_x,
-                values=current_values,
-                subwarp_size=args.subwarp_size,
-                input_vjp_strategy="scatter",
-            ),
-            x,
-        )[1](cotangent)[0]
-    )
-    weighted_values_vjp = jax.jit(
-        lambda current_x, cotangent: jax.vjp(
-            lambda current_values: springmv.csr_spmv(
-                structure,
-                current_x,
-                values=current_values,
-                subwarp_size=args.subwarp_size,
-            ),
-            values,
-        )[1](cotangent)[0]
-    )
-    weighted_logsumexp_forward = jax.jit(
-        lambda current_values, current_x: springmv.csr_logsumexp(
+
+    def springmv_arithmetic_weighted_transpose(current_values, current_x):
+        return springmv.csr_spmv(
+            structure,
+            current_x,
+            values=current_values,
+            subwarp_size=args.subwarp_size,
+            input_vjp_strategy="transpose",
+        )
+
+    def springmv_logsumexp_unweighted(current_x):
+        return springmv.csr_logsumexp(
+            structure,
+            current_x,
+            subwarp_size=args.subwarp_size,
+        )
+
+    def springmv_logsumexp_weighted(current_values, current_x):
+        return springmv.csr_logsumexp(
             structure,
             current_x,
             log_values=current_values,
             subwarp_size=args.subwarp_size,
+            input_vjp_strategy="scatter",
         )
-    )
-    unweighted_logsumexp_forward = jax.jit(
-        lambda current_x: springmv.csr_logsumexp(
+
+    def springmv_logsumexp_weighted_transpose(current_values, current_x):
+        return springmv.csr_logsumexp(
             structure,
             current_x,
+            log_values=current_values,
             subwarp_size=args.subwarp_size,
+            input_vjp_strategy="transpose",
         )
-    )
-    weighted_logsumexp_jvp = jax.jit(
-        lambda current_values, current_x, values_dot, x_dot: jax.jvp(
-            lambda tangent_values, tangent_x: springmv.csr_logsumexp(
-                structure,
-                tangent_x,
-                log_values=tangent_values,
-                subwarp_size=args.subwarp_size,
-            ),
-            (current_values, current_x),
-            (values_dot, x_dot),
-        )[1]
-    )
-    weighted_logsumexp_input_vjp = jax.jit(
-        lambda current_values, cotangent: jax.vjp(
-            lambda current_x: springmv.csr_logsumexp(
-                structure,
-                current_x,
-                log_values=current_values,
-                subwarp_size=args.subwarp_size,
-                input_vjp_strategy="transpose",
-            ),
-            x,
-        )[1](cotangent)[0]
-    )
-    unweighted_logsumexp_input_vjp = jax.jit(
-        lambda cotangent: jax.vjp(
-            lambda current_x: springmv.csr_logsumexp(
-                structure,
-                current_x,
-                subwarp_size=args.subwarp_size,
-            ),
-            x,
-        )[1](cotangent)[0]
-    )
-    weighted_logsumexp_input_vjp_scatter = jax.jit(
-        lambda current_values, cotangent: jax.vjp(
-            lambda current_x: springmv.csr_logsumexp(
-                structure,
-                current_x,
-                log_values=current_values,
-                subwarp_size=args.subwarp_size,
-                input_vjp_strategy="scatter",
-            ),
-            x,
-        )[1](cotangent)[0]
-    )
-    weighted_logsumexp_values_vjp = jax.jit(
-        lambda current_x, cotangent: jax.vjp(
-            lambda current_values: springmv.csr_logsumexp(
-                structure,
-                current_x,
-                log_values=current_values,
-                subwarp_size=args.subwarp_size,
-            ),
-            values,
-        )[1](cotangent)[0]
-    )
-    jax_weighted_forward = jax.jit(jax_csr_matvec)
-    jax_unweighted_input_vjp = jax.jit(
-        lambda cotangent: jax.vjp(
-            lambda current_x: jax_csr_matvec(unit_values, current_x), x
-        )[1](cotangent)[0]
-    )
-    jax_weighted_input_vjp = jax.jit(
-        lambda current_values, cotangent: jax.vjp(
-            lambda current_x: jax_csr_matvec(current_values, current_x),
-            x,
-        )[1](cotangent)[0]
-    )
-    jax_weighted_values_vjp = jax.jit(
-        lambda current_x, cotangent: jax.vjp(
-            lambda current_values: jax_csr_matvec(
-                current_values, current_x
-            ),
-            values,
-        )[1](cotangent)[0]
-    )
-    jax_weighted_logsumexp_forward = jax.jit(jax_segment_logsumexp)
-    jax_unweighted_logsumexp_forward = jax.jit(
-        jax_segment_logsumexp_unweighted
-    )
-    jax_weighted_logsumexp_jvp = jax.jit(
-        lambda current_values, current_x, values_dot, x_dot: jax.jvp(
-            jax_segment_logsumexp,
-            (current_values, current_x),
-            (values_dot, x_dot),
-        )[1]
-    )
-    jax_weighted_logsumexp_input_vjp = jax.jit(
-        lambda current_values, cotangent: jax.vjp(
-            lambda current_x: jax_segment_logsumexp(
-                current_values, current_x
-            ),
-            x,
-        )[1](cotangent)[0]
-    )
-    jax_unweighted_logsumexp_input_vjp = jax.jit(
-        lambda cotangent: jax.vjp(
-            jax_segment_logsumexp_unweighted,
-            x,
-        )[1](cotangent)[0]
-    )
-    jax_weighted_logsumexp_values_vjp = jax.jit(
-        lambda current_x, cotangent: jax.vjp(
-            lambda current_values: jax_segment_logsumexp(
-                current_values, current_x
-            ),
-            values,
-        )[1](cotangent)[0]
-    )
 
-    batched_arithmetic_forward = jax.jit(
-        jax.vmap(
-            lambda current_x: springmv.csr_spmv(
-                structure,
-                current_x,
-                values=values,
-                subwarp_size=args.subwarp_size,
+    jax_arithmetic_unweighted = lambda current_x: jax_csr_matvec(
+        unit_values, current_x
+    )
+    jax_arithmetic_weighted = jax_csr_matvec
+
+    arithmetic_unweighted_forward = jax.jit(springmv_arithmetic_unweighted)
+    jax_arithmetic_unweighted_forward = jax.jit(jax_arithmetic_unweighted)
+    arithmetic_unweighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                springmv_arithmetic_unweighted, current_x
             )
         )
     )
-    batched_jax_arithmetic_forward = jax.jit(
-        jax.vmap(lambda current_x: jax_segment_spmv(values, current_x))
+    jax_arithmetic_unweighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                jax_arithmetic_unweighted, current_x
+            )
+        )
     )
-    def batched_arithmetic_input_vjp(strategy):
-        return jax.jit(
-            jax.vmap(
-                lambda current_x, cotangent: jax.vjp(
+    logsumexp_unweighted_forward = jax.jit(springmv_logsumexp_unweighted)
+    jax_logsumexp_unweighted_forward = jax.jit(
+        jax_segment_logsumexp_unweighted
+    )
+    logsumexp_unweighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                springmv_logsumexp_unweighted, current_x
+            )
+        )
+    )
+    jax_logsumexp_unweighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                jax_segment_logsumexp_unweighted, current_x
+            )
+        )
+    )
+
+    arithmetic_weighted_forward = jax.jit(springmv_arithmetic_weighted)
+    jax_arithmetic_weighted_forward = jax.jit(jax_arithmetic_weighted)
+    arithmetic_weighted_forward_backward_scatter = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                springmv_arithmetic_weighted, current_values, current_x
+            ),
+            argnums=(0, 1),
+        )
+    )
+    arithmetic_weighted_forward_backward_transpose = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                springmv_arithmetic_weighted_transpose,
+                current_values,
+                current_x,
+            ),
+            argnums=(0, 1),
+        )
+    )
+    jax_arithmetic_weighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                jax_arithmetic_weighted, current_values, current_x
+            ),
+            argnums=(0, 1),
+        )
+    )
+    logsumexp_weighted_forward = jax.jit(springmv_logsumexp_weighted)
+    jax_logsumexp_weighted_forward = jax.jit(jax_segment_logsumexp)
+    logsumexp_weighted_forward_backward_scatter = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                springmv_logsumexp_weighted, current_values, current_x
+            ),
+            argnums=(0, 1),
+        )
+    )
+    logsumexp_weighted_forward_backward_transpose = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                springmv_logsumexp_weighted_transpose,
+                current_values,
+                current_x,
+            ),
+            argnums=(0, 1),
+        )
+    )
+    jax_logsumexp_weighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                jax_segment_logsumexp, current_values, current_x
+            ),
+            argnums=(0, 1),
+        )
+    )
+
+    springmv_batched_arithmetic_unweighted = jax.vmap(
+        springmv_arithmetic_unweighted
+    )
+    jax_batched_arithmetic_unweighted = jax.vmap(
+        jax_segment_spmv_unweighted
+    )
+    springmv_batched_logsumexp_unweighted = jax.vmap(
+        springmv_logsumexp_unweighted
+    )
+    jax_batched_logsumexp_unweighted = jax.vmap(
+        jax_segment_logsumexp_unweighted
+    )
+
+    batched_arithmetic_unweighted_forward = jax.jit(
+        springmv_batched_arithmetic_unweighted
+    )
+    batched_jax_arithmetic_unweighted_forward = jax.jit(
+        jax_batched_arithmetic_unweighted
+    )
+    batched_arithmetic_unweighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                springmv_batched_arithmetic_unweighted, current_x
+            )
+        )
+    )
+    batched_jax_arithmetic_unweighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                jax_batched_arithmetic_unweighted, current_x
+            )
+        )
+    )
+    batched_logsumexp_unweighted_forward = jax.jit(
+        springmv_batched_logsumexp_unweighted
+    )
+    batched_jax_logsumexp_unweighted_forward = jax.jit(
+        jax_batched_logsumexp_unweighted
+    )
+    batched_logsumexp_unweighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                springmv_batched_logsumexp_unweighted, current_x
+            )
+        )
+    )
+    batched_jax_logsumexp_unweighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                jax_batched_logsumexp_unweighted, current_x
+            )
+        )
+    )
+
+    def springmv_batched_arithmetic_weighted(current_values, current_x):
+        return jax.vmap(
+            lambda batch_x: springmv_arithmetic_weighted(
+                current_values, batch_x
+            )
+        )(current_x)
+
+    def springmv_batched_arithmetic_weighted_transpose(
+        current_values, current_x
+    ):
+        return jax.vmap(
+            lambda batch_x: springmv_arithmetic_weighted_transpose(
+                current_values, batch_x
+            )
+        )(current_x)
+
+    def jax_batched_arithmetic_weighted(current_values, current_x):
+        return jax.vmap(
+            lambda batch_x: jax_segment_spmv(current_values, batch_x)
+        )(current_x)
+
+    def springmv_batched_logsumexp_weighted(current_values, current_x):
+        return jax.vmap(
+            lambda batch_x: springmv_logsumexp_weighted(
+                current_values, batch_x
+            )
+        )(current_x)
+
+    def springmv_batched_logsumexp_weighted_transpose(
+        current_values, current_x
+    ):
+        return jax.vmap(
+            lambda batch_x: springmv_logsumexp_weighted_transpose(
+                current_values, batch_x
+            )
+        )(current_x)
+
+    def jax_batched_logsumexp_weighted(current_values, current_x):
+        return jax.vmap(
+            lambda batch_x: jax_segment_logsumexp(
+                current_values, batch_x
+            )
+        )(current_x)
+
+    batched_arithmetic_weighted_forward = jax.jit(
+        springmv_batched_arithmetic_weighted
+    )
+    batched_jax_arithmetic_weighted_forward = jax.jit(
+        jax_batched_arithmetic_weighted
+    )
+    batched_arithmetic_weighted_forward_backward_scatter = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                springmv_batched_arithmetic_weighted,
+                current_values,
+                current_x,
+            ),
+            argnums=(0, 1),
+        )
+    )
+    batched_arithmetic_weighted_forward_backward_transpose = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                springmv_batched_arithmetic_weighted_transpose,
+                current_values,
+                current_x,
+            ),
+            argnums=(0, 1),
+        )
+    )
+    batched_jax_arithmetic_weighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                jax_batched_arithmetic_weighted,
+                current_values,
+                current_x,
+            ),
+            argnums=(0, 1),
+        )
+    )
+    batched_logsumexp_weighted_forward = jax.jit(
+        springmv_batched_logsumexp_weighted
+    )
+    batched_jax_logsumexp_weighted_forward = jax.jit(
+        jax_batched_logsumexp_weighted
+    )
+    batched_logsumexp_weighted_forward_backward_scatter = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                springmv_batched_logsumexp_weighted,
+                current_values,
+                current_x,
+            ),
+            argnums=(0, 1),
+        )
+    )
+    batched_logsumexp_weighted_forward_backward_transpose = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                springmv_batched_logsumexp_weighted_transpose,
+                current_values,
+                current_x,
+            ),
+            argnums=(0, 1),
+        )
+    )
+    batched_jax_logsumexp_weighted_forward_backward = jax.jit(
+        jax.grad(
+            lambda current_values, current_x: squared_output_loss(
+                jax_batched_logsumexp_weighted,
+                current_values,
+                current_x,
+            ),
+            argnums=(0, 1),
+        )
+    )
+
+    if args.diagnose_input_vjp:
+        weighted_input_vjp = jax.jit(
+            lambda current_values, cotangent: jax.vjp(
+                lambda current_x: springmv.csr_spmv(
+                    structure,
+                    current_x,
+                    values=current_values,
+                    subwarp_size=args.subwarp_size,
+                    input_vjp_strategy="transpose",
+                ),
+                x,
+            )[1](cotangent)[0]
+        )
+        weighted_input_vjp_scatter = jax.jit(
+            lambda current_values, cotangent: jax.vjp(
+                lambda current_x: springmv_arithmetic_weighted(
+                    current_values, current_x
+                ),
+                x,
+            )[1](cotangent)[0]
+        )
+        jax_weighted_input_vjp = jax.jit(
+            lambda current_values, cotangent: jax.vjp(
+                lambda current_x: jax_csr_matvec(
+                    current_values, current_x
+                ),
+                x,
+            )[1](cotangent)[0]
+        )
+        weighted_logsumexp_input_vjp = jax.jit(
+            lambda current_values, cotangent: jax.vjp(
+                lambda current_x: springmv.csr_logsumexp(
+                    structure,
+                    current_x,
+                    log_values=current_values,
+                    subwarp_size=args.subwarp_size,
+                    input_vjp_strategy="transpose",
+                ),
+                x,
+            )[1](cotangent)[0]
+        )
+        jax_weighted_logsumexp_input_vjp = jax.jit(
+            lambda current_values, cotangent: jax.vjp(
+                lambda current_x: jax_segment_logsumexp(
+                    current_values, current_x
+                ),
+                x,
+            )[1](cotangent)[0]
+        )
+
+        def batched_arithmetic_input_vjp_transpose(current_x, cotangent):
+            return jax.vmap(
+                lambda batch_x, batch_cotangent: jax.vjp(
                     lambda differentiable_x: springmv.csr_spmv(
                         structure,
                         differentiable_x,
                         values=values,
                         subwarp_size=args.subwarp_size,
-                        input_vjp_strategy=strategy,
+                        input_vjp_strategy="transpose",
                     ),
-                    current_x,
-                )[1](cotangent)[0]
-            )
-        )
+                    batch_x,
+                )[1](batch_cotangent)[0]
+            )(current_x, cotangent)
 
-    batched_arithmetic_input_vjp_transpose = (
-        batched_arithmetic_input_vjp("transpose")
-    )
-    batched_arithmetic_input_vjp_scatter = batched_arithmetic_input_vjp(
-        "scatter"
-    )
-    batched_jax_arithmetic_input_vjp = jax.jit(
-        jax.vmap(
-            lambda current_x, cotangent: jax.vjp(
-                lambda differentiable_x: jax_segment_spmv(
-                    values, differentiable_x
-                ),
-                current_x,
-            )[1](cotangent)[0]
+        batched_arithmetic_input_vjp_transpose = jax.jit(
+            batched_arithmetic_input_vjp_transpose
         )
-    )
-    batched_unweighted_logsumexp_forward = jax.jit(
-        jax.vmap(
-            lambda current_x: springmv.csr_logsumexp(
-                structure,
-                current_x,
-                subwarp_size=args.subwarp_size,
-            )
-        )
-    )
-    batched_jax_unweighted_logsumexp_forward = jax.jit(
-        jax.vmap(jax_segment_logsumexp_unweighted)
-    )
-    batched_weighted_logsumexp_forward = jax.jit(
-        jax.vmap(
-            lambda current_x: springmv.csr_logsumexp(
-                structure,
-                current_x,
-                log_values=values,
-                subwarp_size=args.subwarp_size,
-            )
-        )
-    )
-    batched_jax_weighted_logsumexp_forward = jax.jit(
-        jax.vmap(lambda current_x: jax_segment_logsumexp(values, current_x))
-    )
-
-    def batched_logsumexp_input_vjp(strategy):
-        return jax.jit(
+        batched_jax_arithmetic_input_vjp = jax.jit(
             jax.vmap(
-                lambda current_x, cotangent: jax.vjp(
+                lambda batch_x, batch_cotangent: jax.vjp(
+                    lambda differentiable_x: jax_segment_spmv(
+                        values, differentiable_x
+                    ),
+                    batch_x,
+                )[1](batch_cotangent)[0]
+            )
+        )
+
+        def batched_logsumexp_input_vjp_transpose(current_x, cotangent):
+            return jax.vmap(
+                lambda batch_x, batch_cotangent: jax.vjp(
                     lambda differentiable_x: springmv.csr_logsumexp(
                         structure,
                         differentiable_x,
                         log_values=values,
                         subwarp_size=args.subwarp_size,
-                        input_vjp_strategy=strategy,
+                        input_vjp_strategy="transpose",
                     ),
-                    current_x,
-                )[1](cotangent)[0]
+                    batch_x,
+                )[1](batch_cotangent)[0]
+            )(current_x, cotangent)
+
+        batched_logsumexp_input_vjp_transpose = jax.jit(
+            batched_logsumexp_input_vjp_transpose
+        )
+        batched_jax_logsumexp_input_vjp = jax.jit(
+            jax.vmap(
+                lambda batch_x, batch_cotangent: jax.vjp(
+                    lambda differentiable_x: jax_segment_logsumexp(
+                        values, differentiable_x
+                    ),
+                    batch_x,
+                )[1](batch_cotangent)[0]
             )
         )
-
-    batched_logsumexp_input_vjp_transpose = batched_logsumexp_input_vjp(
-        "transpose"
-    )
-    batched_logsumexp_input_vjp_scatter = batched_logsumexp_input_vjp(
-        "scatter"
-    )
-    batched_jax_logsumexp_input_vjp = jax.jit(
-        jax.vmap(
-            lambda current_x, cotangent: jax.vjp(
-                lambda differentiable_x: jax_segment_logsumexp(
-                    values, differentiable_x
-                ),
-                current_x,
-            )[1](cotangent)[0]
-        )
-    )
-    if args.diagnose_input_vjp:
         reordered_input_vjp = jax.jit(
             lambda current_transposed_values, cotangent: springmv.csr_spmv(
                 transposed_structure,
@@ -541,208 +698,277 @@ def main() -> None:
         "times are median [minimum, maximum]; final ratio is "
         "right median / left median"
     )
+    print("\nunweighted (backward differentiates the input)")
     _benchmark_pair(
-        "arithmetic weighted forward",
-        lambda: weighted_forward(values, x),
-        lambda: jax_weighted_forward(values, x),
+        "single arithmetic forward",
+        lambda: arithmetic_unweighted_forward(x),
+        lambda: jax_arithmetic_unweighted_forward(x),
         args.warmup,
         args.iterations,
+        jax_label="JAX CSR",
     )
     _benchmark_pair(
-        "arithmetic unweighted input VJP",
-        lambda: unweighted_input_vjp(output_cotangent),
-        lambda: jax_unweighted_input_vjp(output_cotangent),
+        "single arithmetic forward + backward (transpose)",
+        lambda: arithmetic_unweighted_forward_backward(x),
+        lambda: jax_arithmetic_unweighted_forward_backward(x),
         args.warmup,
         args.iterations,
+        jax_label="JAX CSR",
     )
     _benchmark_pair(
-        "arithmetic input VJP transpose",
-        lambda: weighted_input_vjp(values, output_cotangent),
-        lambda: jax_weighted_input_vjp(values, output_cotangent),
+        "single log-sum-exp forward",
+        lambda: logsumexp_unweighted_forward(x),
+        lambda: jax_logsumexp_unweighted_forward(x),
         args.warmup,
         args.iterations,
+        jax_label="JAX segment",
     )
     _benchmark_pair(
-        "arithmetic input VJP scatter",
-        lambda: weighted_input_vjp_scatter(values, output_cotangent),
-        lambda: jax_weighted_input_vjp(values, output_cotangent),
+        "single log-sum-exp forward + backward (transpose)",
+        lambda: logsumexp_unweighted_forward_backward(x),
+        lambda: jax_logsumexp_unweighted_forward_backward(x),
         args.warmup,
         args.iterations,
+        jax_label="JAX segment",
     )
     _benchmark_pair(
-        "arithmetic weighted values VJP",
-        lambda: weighted_values_vjp(x, output_cotangent),
-        lambda: jax_weighted_values_vjp(x, output_cotangent),
+        f"batched arithmetic forward (batch={args.batch_size})",
+        lambda: batched_arithmetic_unweighted_forward(x_batch),
+        lambda: batched_jax_arithmetic_unweighted_forward(x_batch),
         args.warmup,
         args.iterations,
+        jax_label="JAX segment",
     )
     _benchmark_pair(
-        "log-sum-exp unweighted forward",
-        lambda: unweighted_logsumexp_forward(x),
-        lambda: jax_unweighted_logsumexp_forward(x),
+        f"batched arithmetic forward + backward (transpose, batch={args.batch_size})",
+        lambda: batched_arithmetic_unweighted_forward_backward(x_batch),
+        lambda: batched_jax_arithmetic_unweighted_forward_backward(x_batch),
         args.warmup,
         args.iterations,
+        jax_label="JAX segment",
     )
     _benchmark_pair(
-        "log-sum-exp weighted forward",
-        lambda: weighted_logsumexp_forward(values, x),
-        lambda: jax_weighted_logsumexp_forward(values, x),
+        f"batched log-sum-exp forward (batch={args.batch_size})",
+        lambda: batched_logsumexp_unweighted_forward(x_batch),
+        lambda: batched_jax_logsumexp_unweighted_forward(x_batch),
         args.warmup,
         args.iterations,
+        jax_label="JAX segment",
     )
     _benchmark_pair(
-        "log-sum-exp weighted JVP",
-        lambda: weighted_logsumexp_jvp(values, x, values, x),
-        lambda: jax_weighted_logsumexp_jvp(values, x, values, x),
+        f"batched log-sum-exp forward + backward (transpose, batch={args.batch_size})",
+        lambda: batched_logsumexp_unweighted_forward_backward(x_batch),
+        lambda: batched_jax_logsumexp_unweighted_forward_backward(x_batch),
         args.warmup,
         args.iterations,
+        jax_label="JAX segment",
+    )
+
+    print(
+        "\nweighted (backward differentiates edge values and input; "
+        "batched rows share edge values)"
     )
     _benchmark_pair(
-        "log-sum-exp unweighted input VJP",
-        lambda: unweighted_logsumexp_input_vjp(output_cotangent),
-        lambda: jax_unweighted_logsumexp_input_vjp(output_cotangent),
+        "single arithmetic forward",
+        lambda: arithmetic_weighted_forward(values, x),
+        lambda: jax_arithmetic_weighted_forward(values, x),
         args.warmup,
         args.iterations,
+        jax_label="JAX CSR",
     )
     _benchmark_pair(
-        "log-sum-exp input VJP transpose",
-        lambda: weighted_logsumexp_input_vjp(values, output_cotangent),
-        lambda: jax_weighted_logsumexp_input_vjp(
-            values, output_cotangent
+        "single arithmetic forward + backward (scatter)",
+        lambda: arithmetic_weighted_forward_backward_scatter(values, x),
+        lambda: jax_arithmetic_weighted_forward_backward(values, x),
+        args.warmup,
+        args.iterations,
+        jax_label="JAX CSR",
+    )
+    _benchmark_pair(
+        "single arithmetic forward + backward (transpose)",
+        lambda: arithmetic_weighted_forward_backward_transpose(values, x),
+        lambda: jax_arithmetic_weighted_forward_backward(values, x),
+        args.warmup,
+        args.iterations,
+        jax_label="JAX CSR",
+    )
+    _benchmark_pair(
+        "single log-sum-exp forward",
+        lambda: logsumexp_weighted_forward(values, x),
+        lambda: jax_logsumexp_weighted_forward(values, x),
+        args.warmup,
+        args.iterations,
+        jax_label="JAX segment",
+    )
+    _benchmark_pair(
+        "single log-sum-exp forward + backward (scatter)",
+        lambda: logsumexp_weighted_forward_backward_scatter(values, x),
+        lambda: jax_logsumexp_weighted_forward_backward(values, x),
+        args.warmup,
+        args.iterations,
+        jax_label="JAX segment",
+    )
+    _benchmark_pair(
+        "single log-sum-exp forward + backward (transpose)",
+        lambda: logsumexp_weighted_forward_backward_transpose(values, x),
+        lambda: jax_logsumexp_weighted_forward_backward(values, x),
+        args.warmup,
+        args.iterations,
+        jax_label="JAX segment",
+    )
+    _benchmark_pair(
+        f"batched arithmetic forward (batch={args.batch_size})",
+        lambda: batched_arithmetic_weighted_forward(values, x_batch),
+        lambda: batched_jax_arithmetic_weighted_forward(values, x_batch),
+        args.warmup,
+        args.iterations,
+        jax_label="JAX segment",
+    )
+    _benchmark_pair(
+        f"batched arithmetic forward + backward (scatter, batch={args.batch_size})",
+        lambda: batched_arithmetic_weighted_forward_backward_scatter(
+            values, x_batch
+        ),
+        lambda: batched_jax_arithmetic_weighted_forward_backward(
+            values, x_batch
         ),
         args.warmup,
         args.iterations,
+        jax_label="JAX segment",
     )
     _benchmark_pair(
-        "log-sum-exp input VJP scatter",
-        lambda: weighted_logsumexp_input_vjp_scatter(
-            values, output_cotangent
+        f"batched arithmetic forward + backward (transpose, batch={args.batch_size})",
+        lambda: batched_arithmetic_weighted_forward_backward_transpose(
+            values, x_batch
         ),
-        lambda: jax_weighted_logsumexp_input_vjp(
-            values, output_cotangent
+        lambda: batched_jax_arithmetic_weighted_forward_backward(
+            values, x_batch
         ),
         args.warmup,
         args.iterations,
+        jax_label="JAX segment",
     )
     _benchmark_pair(
-        "log-sum-exp values VJP",
-        lambda: weighted_logsumexp_values_vjp(x, output_cotangent),
-        lambda: jax_weighted_logsumexp_values_vjp(x, output_cotangent),
+        f"batched log-sum-exp forward (batch={args.batch_size})",
+        lambda: batched_logsumexp_weighted_forward(values, x_batch),
+        lambda: batched_jax_logsumexp_weighted_forward(values, x_batch),
         args.warmup,
         args.iterations,
-    )
-    print(f"\nvmap batch={args.batch_size} (shared weights)")
-    _benchmark_pair(
-        "batched arithmetic forward",
-        lambda: batched_arithmetic_forward(x_batch),
-        lambda: batched_jax_arithmetic_forward(x_batch),
-        args.warmup,
-        args.iterations,
+        jax_label="JAX segment",
     )
     _benchmark_pair(
-        "batched arithmetic VJP transpose",
-        lambda: batched_arithmetic_input_vjp_transpose(
-            x_batch, output_cotangent_batch
+        f"batched log-sum-exp forward + backward (scatter, batch={args.batch_size})",
+        lambda: batched_logsumexp_weighted_forward_backward_scatter(
+            values, x_batch
         ),
-        lambda: batched_jax_arithmetic_input_vjp(
-            x_batch, output_cotangent_batch
+        lambda: batched_jax_logsumexp_weighted_forward_backward(
+            values, x_batch
         ),
         args.warmup,
         args.iterations,
+        jax_label="JAX segment",
     )
     _benchmark_pair(
-        "batched arithmetic VJP scatter",
-        lambda: batched_arithmetic_input_vjp_scatter(
-            x_batch, output_cotangent_batch
+        f"batched log-sum-exp forward + backward (transpose, batch={args.batch_size})",
+        lambda: batched_logsumexp_weighted_forward_backward_transpose(
+            values, x_batch
         ),
-        lambda: batched_jax_arithmetic_input_vjp(
-            x_batch, output_cotangent_batch
+        lambda: batched_jax_logsumexp_weighted_forward_backward(
+            values, x_batch
         ),
         args.warmup,
         args.iterations,
+        jax_label="JAX segment",
     )
-    _benchmark_pair(
-        "batched LSE unweighted forward",
-        lambda: batched_unweighted_logsumexp_forward(x_batch),
-        lambda: batched_jax_unweighted_logsumexp_forward(x_batch),
-        args.warmup,
-        args.iterations,
-    )
-    _benchmark_pair(
-        "batched LSE weighted forward",
-        lambda: batched_weighted_logsumexp_forward(x_batch),
-        lambda: batched_jax_weighted_logsumexp_forward(x_batch),
-        args.warmup,
-        args.iterations,
-    )
-    _benchmark_pair(
-        "batched LSE input VJP transpose",
-        lambda: batched_logsumexp_input_vjp_transpose(
-            x_batch, output_cotangent_batch
-        ),
-        lambda: batched_jax_logsumexp_input_vjp(
-            x_batch, output_cotangent_batch
-        ),
-        args.warmup,
-        args.iterations,
-    )
-    _benchmark_pair(
-        "batched LSE input VJP scatter",
-        lambda: batched_logsumexp_input_vjp_scatter(
-            x_batch, output_cotangent_batch
-        ),
-        lambda: batched_jax_logsumexp_input_vjp(
-            x_batch, output_cotangent_batch
-        ),
-        args.warmup,
-        args.iterations,
-    )
+
     if args.diagnose_input_vjp:
-        print("\nweighted arithmetic input-VJP diagnostics")
+        print("\nbackward-only input-VJP strategy diagnostics")
         _benchmark_pair(
-            "permutation gather",
+            "log-sum-exp weighted VJP (transpose)",
+            lambda: weighted_logsumexp_input_vjp(
+                values, output_cotangent
+            ),
+            lambda: jax_weighted_logsumexp_input_vjp(
+                values, output_cotangent
+            ),
+            args.warmup,
+            args.iterations,
+            jax_label="JAX segment",
+        )
+        _benchmark_pair(
+            "batched arithmetic weighted VJP (transpose)",
+            lambda: batched_arithmetic_input_vjp_transpose(
+                x_batch, output_cotangent_batch
+            ),
+            lambda: batched_jax_arithmetic_input_vjp(
+                x_batch, output_cotangent_batch
+            ),
+            args.warmup,
+            args.iterations,
+            jax_label="JAX segment",
+        )
+        _benchmark_pair(
+            "batched log-sum-exp weighted VJP (transpose)",
+            lambda: batched_logsumexp_input_vjp_transpose(
+                x_batch, output_cotangent_batch
+            ),
+            lambda: batched_jax_logsumexp_input_vjp(
+                x_batch, output_cotangent_batch
+            ),
+            args.warmup,
+            args.iterations,
+            jax_label="JAX segment",
+        )
+
+        print("\nweighted arithmetic implementation diagnostics")
+        _benchmark_pair(
+            "transpose with permutation gather",
             lambda: weighted_input_vjp(values, output_cotangent),
             lambda: jax_weighted_input_vjp(values, output_cotangent),
             args.warmup,
             args.iterations,
+            jax_label="JAX CSR",
         )
         _benchmark_pair(
-            "SpringMV atomic scatter",
+            "atomic scatter",
             lambda: weighted_input_vjp_scatter(
                 values, output_cotangent
             ),
             lambda: jax_weighted_input_vjp(values, output_cotangent),
             args.warmup,
             args.iterations,
+            jax_label="JAX CSR",
         )
         _benchmark_pair(
-            "pre-reordered values",
+            "transpose with pre-reordered values",
             lambda: reordered_input_vjp(
                 transposed_values, output_cotangent
             ),
             lambda: jax_weighted_input_vjp(values, output_cotangent),
             args.warmup,
             args.iterations,
+            jax_label="JAX CSR",
         )
         _benchmark_pair(
-            "reorder included",
+            "transpose with reorder included",
             lambda: reorder_and_input_vjp(values, output_cotangent),
             lambda: jax_weighted_input_vjp(values, output_cotangent),
             args.warmup,
             args.iterations,
+            jax_label="JAX CSR",
         )
-        atomic_samples, cusparse_samples = _time_pair(
+        atomic_samples, csr_samples = _time_pair(
             lambda: jax_atomic_input_vjp(values, output_cotangent),
             lambda: jax_weighted_input_vjp(values, output_cotangent),
             args.warmup,
             args.iterations,
         )
         _report_comparison(
-            "atomic scatter",
+            "JAX input-VJP implementations",
             atomic_samples,
-            cusparse_samples,
-            springmv_label="JAX-scatter",
-            jax_label="cuSPARSE",
+            csr_samples,
+            springmv_label="JAX scatter",
+            jax_label="JAX CSR",
         )
 
 

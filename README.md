@@ -105,32 +105,46 @@ report GFLOP/s. Setup, validation, memory allocation, and transfers are outside
 the timed region.
 
 The JAX benchmark reports synchronized median, minimum, and maximum execution
-times for arithmetic and log-sum-exp forward execution, JVPs, input VJPs, and
-value VJPs. Log-sum-exp reports both unweighted forward/input-VJP and weighted
-paths. Each SpringMV operation is paired with a native-JAX baseline and a
-speedup computed as `JAX median / SpringMV median`, so a value greater than one
-means SpringMV is faster. Arithmetic uses
-`jax.experimental.sparse.csr_matvec`. Because JAX has no sparse log-semiring
-matvec, its log-sum-exp baseline uses a stable composition of
-`jax.ops.segment_max` and `jax.ops.segment_sum`. The segment baseline stores a
-precomputed row index for every nonzero, while SpringMV consumes CSR row
-offsets directly. Structure construction, row-index construction, and JIT
-compilation occur outside the timed region.
+times for arithmetic and log-sum-exp. It first reports the unweighted case and
+then the weighted case. Each section contains single-vector and `jax.vmap`
+measurements for forward execution and combined forward-plus-backward
+execution. The combined measurement requests only the gradient of
+`0.5 * sum(output**2)`. Its output-dependent cotangent guarantees that the
+forward pass remains part of the compiled computation without forcing the
+complete forward result to be returned. Unweighted backward differentiates the
+input. Weighted backward differentiates both edge values and the input;
+batched weighted measurements share one edge value array and accumulate its
+gradient across the batch. Every weighted forward-plus-backward case is
+reported with both `scatter` and `transpose` input-gradient strategies;
+forward-only execution is identical between those strategies and is reported
+once.
 
-`--batch-size` controls an additional `jax.vmap` section with shared edge
-weights. It reports fused arithmetic and log-sum-exp forward execution and
-weighted input VJPs with the transpose and atomic-scatter strategies as
-separate rows. The batched arithmetic baseline uses a native-JAX segment
-reduction.
+Each SpringMV operation is paired with a native-JAX baseline and a speedup
+computed as `JAX median / SpringMV median`, so a value greater than one means
+SpringMV is faster. Single-vector arithmetic uses
+`jax.experimental.sparse.csr_matvec`; its unweighted baseline necessarily
+stores unit edge values. Batched arithmetic uses a native-JAX segment
+reduction. Because JAX has no sparse log-semiring matvec, its log-sum-exp
+baseline uses a stable composition of `jax.ops.segment_max` and
+`jax.ops.segment_sum`. Segment baselines store a precomputed row index for every
+nonzero, while SpringMV consumes CSR row offsets directly. Structure
+construction, row-index construction, and JIT compilation occur outside the
+timed region.
+
+SpringMV unweighted backward uses the precomputed transpose. `--batch-size`
+selects the mapped input batch size. Output labels distinguish the
+single-vector `JAX CSR` baseline from `JAX segment` baselines.
+`--diagnose-input-vjp` additionally reports isolated backward-only and
+value-reordering diagnostics.
 
 `--subwarp-size` selects an explicit SpringMV width for scheduling experiments.
 `--column-pattern` selects `uniform`, duplicate-heavy `diagonal`, concentrated
 `hotspot`, or maximally contended `single` column indices.
-`--diagnose-input-vjp` additionally compares the existing permutation-gather
-kernel, the new SpringMV atomic-scatter kernel, pre-reordered transpose values,
-dynamic value reordering, a native-JAX atomic scatter, and cuSPARSE transpose
-SpMV. The pre-reordered measurement excludes the one-time reorder; the dynamic
-measurement includes it.
+`--diagnose-input-vjp` additionally compares the scatter and transpose input
+VJPs for single and batched inputs. Its detailed arithmetic section separates
+permutation-gather, pre-reordered transpose values, dynamic value reordering,
+and native-JAX scatter/CSR paths. The pre-reordered measurement excludes the
+one-time reorder; the dynamic measurement includes it.
 
 ## Python and JAX API
 
@@ -216,10 +230,10 @@ batched_weights = jax.jit(
 )(log_values_batch, log_x_batch)
 ```
 
-Mapped forward reductions use one fused batch-aware CUDA launch. Arithmetic
+Vmapped forward reductions use one fused batch-aware CUDA launch. Arithmetic
 and log-sum-exp `vmap` also compose with first-order `jvp`, VJP, and `grad`;
-their mapped backward rules currently reuse the existing per-example native
-kernels. Batched or ragged `CsrStructure` objects are not supported.
+their mapped backward rules reuse the existing per-example native kernels.
+Batched or ragged `CsrStructure` objects are not supported.
 
 `csr_spmv` accepts optional `values`, `csr_logsumexp` accepts optional
 `log_values`, and `csr_minplus`/`csr_maxplus` accept optional `edge_values`.
@@ -272,12 +286,13 @@ log_values_grad, log_x_grad = jax.grad(
 ```
 
 Unweighted input VJPs always use the transpose stored in `CsrStructure`.
-Weighted arithmetic and log-sum-exp operations retain two implementations for
-benchmarking. `input_vjp_strategy="transpose"` reads original values through
-`transpose_permutation`; `input_vjp_strategy="scatter"` traverses original CSR
-and atomically accumulates into the input cotangent. Scatter is the default for
-weighted operations because it avoids indirect value reads. Transpose remains
-available for matrices where atomic contention makes it faster:
+Weighted arithmetic and log-sum-exp operations retain transpose and scatter
+implementations for benchmarking. `input_vjp_strategy="transpose"` reads
+original values through `transpose_permutation`, while
+`input_vjp_strategy="scatter"` traverses original CSR and atomically
+accumulates into the input cotangent. Scatter is the default for weighted
+operations because it avoids indirect value reads. Transpose remains available
+for matrices where atomic contention makes it faster:
 
 ```python
 x_grad_scatter = jax.grad(

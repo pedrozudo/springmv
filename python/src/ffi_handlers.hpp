@@ -9,17 +9,25 @@ namespace springmv::jax_ffi {
 
 XLA_FFI_Handler* csr_spmv_unweighted_handler() noexcept;
 XLA_FFI_Handler* csr_spmv_weighted_handler() noexcept;
+XLA_FFI_Handler* csr_spmv_batched_unweighted_handler() noexcept;
+XLA_FFI_Handler* csr_spmv_batched_weighted_handler() noexcept;
 XLA_FFI_Handler* csr_spmv_input_vjp_handler() noexcept;
 XLA_FFI_Handler* csr_spmv_input_vjp_scatter_handler() noexcept;
 XLA_FFI_Handler* csr_spmv_values_vjp_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_unweighted_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_weighted_handler() noexcept;
+XLA_FFI_Handler* csr_logsumexp_batched_unweighted_handler() noexcept;
+XLA_FFI_Handler* csr_logsumexp_batched_weighted_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_jvp_unweighted_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_jvp_weighted_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_input_vjp_unweighted_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_input_vjp_weighted_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_input_vjp_scatter_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_values_vjp_handler() noexcept;
+XLA_FFI_Handler* csr_minplus_batched_unweighted_handler() noexcept;
+XLA_FFI_Handler* csr_minplus_batched_weighted_handler() noexcept;
+XLA_FFI_Handler* csr_maxplus_batched_unweighted_handler() noexcept;
+XLA_FFI_Handler* csr_maxplus_batched_weighted_handler() noexcept;
 XLA_FFI_Handler* csr_minplus_unweighted_handler() noexcept;
 XLA_FFI_Handler* csr_minplus_weighted_handler() noexcept;
 XLA_FFI_Handler* csr_maxplus_unweighted_handler() noexcept;

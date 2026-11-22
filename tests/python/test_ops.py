@@ -142,14 +142,138 @@ def test_jit_accepts_dynamic_csr_structure(
     )
 
 
-def test_vmap_is_explicitly_unsupported(
+@pytest.mark.parametrize(("operation", "function", "values_name"), CASES)
+@pytest.mark.parametrize("weighted", [False, True])
+def test_vmap_inputs_matches_stacked_calls(
+    operation: str,
+    function: Callable[..., jax.Array],
+    values_name: str,
+    weighted: bool,
     structure: springmv.CsrStructure,
 ) -> None:
-    batch = jnp.stack((jnp.asarray(X), jnp.asarray(X)))
-    with pytest.raises(NotImplementedError, match="vmap"):
+    del operation
+    inputs = jnp.stack((jnp.asarray(X), jnp.asarray(X) + 0.5))
+    kwargs = {values_name: jnp.asarray(EDGE_VALUES)} if weighted else {}
+    mapped = jax.jit(
+        jax.vmap(lambda x: function(structure, x, **kwargs))
+    )(inputs)
+    expected = jnp.stack(
+        [function(structure, inputs[index], **kwargs) for index in range(2)]
+    )
+    np.testing.assert_allclose(mapped, expected, rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.parametrize(("operation", "function", "values_name"), CASES)
+def test_vmap_batched_values_and_inputs(
+    operation: str,
+    function: Callable[..., jax.Array],
+    values_name: str,
+    structure: springmv.CsrStructure,
+) -> None:
+    del operation
+    inputs = jnp.stack((jnp.asarray(X), jnp.asarray(X) - 0.25))
+    values = jnp.stack(
+        (jnp.asarray(EDGE_VALUES), jnp.asarray(EDGE_VALUES) + 0.75)
+    )
+    mapped = jax.jit(
         jax.vmap(
-            lambda x: springmv.csr_spmv(
-                structure,
-                x,
+            lambda current_values, x: function(
+                structure, x, **{values_name: current_values}
             )
-        )(batch)
+        )
+    )(values, inputs)
+    expected = jnp.stack(
+        [
+            function(
+                structure,
+                inputs[index],
+                **{values_name: values[index]},
+            )
+            for index in range(2)
+        ]
+    )
+    np.testing.assert_allclose(mapped, expected, rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.parametrize(("operation", "function", "values_name"), CASES)
+def test_vmap_batched_values_with_shared_input(
+    operation: str,
+    function: Callable[..., jax.Array],
+    values_name: str,
+    structure: springmv.CsrStructure,
+) -> None:
+    del operation
+    values = jnp.stack(
+        (jnp.asarray(EDGE_VALUES), jnp.asarray(EDGE_VALUES) + 0.75)
+    )
+    actual = jax.jit(
+        jax.vmap(
+            lambda current_values: function(
+                structure,
+                jnp.asarray(X),
+                **{values_name: current_values},
+            )
+        )
+    )(values)
+    expected = jnp.stack(
+        [
+            function(
+                structure,
+                jnp.asarray(X),
+                **{values_name: values[index]},
+            )
+            for index in range(2)
+        ]
+    )
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+
+
+@pytest.mark.parametrize(("operation", "function", "values_name"), CASES)
+def test_vmap_empty_batch(
+    operation: str,
+    function: Callable[..., jax.Array],
+    values_name: str,
+    structure: springmv.CsrStructure,
+) -> None:
+    del operation, values_name
+    inputs = jnp.empty((0, X.size), dtype=jnp.float32)
+    actual = jax.jit(jax.vmap(lambda x: function(structure, x)))(inputs)
+    assert actual.shape == (0, structure.num_rows)
+    assert actual.dtype == jnp.float32
+
+
+def test_vmap_nonleading_input_axis(
+    structure: springmv.CsrStructure,
+) -> None:
+    inputs = jnp.stack((jnp.asarray(X), jnp.asarray(X) + 1.0), axis=1)
+    actual = jax.vmap(
+        lambda x: springmv.csr_spmv(structure, x),
+        in_axes=1,
+        out_axes=1,
+    )(inputs)
+    expected = jnp.stack(
+        [springmv.csr_spmv(structure, inputs[:, index]) for index in range(2)],
+        axis=1,
+    )
+    np.testing.assert_allclose(actual, expected, rtol=2e-6)
+
+
+def test_vmap_of_jitted_operation(
+    structure: springmv.CsrStructure,
+) -> None:
+    inputs = jnp.stack((jnp.asarray(X), jnp.asarray(X) + 1.0))
+    single = jax.jit(lambda x: springmv.csr_spmv(structure, x))
+    actual = jax.vmap(single)(inputs)
+    expected = jnp.stack([single(inputs[index]) for index in range(2)])
+    np.testing.assert_allclose(actual, expected, rtol=2e-6)
+
+
+def test_vmap_rejects_batched_structure(
+    structure: springmv.CsrStructure,
+) -> None:
+    batched_structure = jax.tree.map(
+        lambda array: jnp.stack((array, array)), structure
+    )
+    inputs = jnp.stack((jnp.asarray(X), jnp.asarray(X)))
+    with pytest.raises(NotImplementedError, match="shared CsrStructure"):
+        jax.vmap(springmv.csr_spmv)(batched_structure, inputs)

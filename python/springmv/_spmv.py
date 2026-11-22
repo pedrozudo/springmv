@@ -6,12 +6,17 @@ import functools
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax import ffi as jffi
 from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 
-from ._ops import _raw_reduction, _validate_subwarp_size
+from ._ops import (
+    _raw_batched_reduction,
+    _raw_reduction,
+    _validate_subwarp_size,
+)
 from ._structure import CsrStructure
 from ._validation import as_float_vector
 
@@ -147,15 +152,213 @@ mlir.register_lowering(
 )
 
 
-def _vmap_not_supported(batched_args, batch_dimensions, **params):
-    del batched_args, batch_dimensions, params
-    raise NotImplementedError(
-        "springmv.csr_spmv does not support jax.vmap"
+def _unweighted_batched_impl(
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    x,
+    *,
+    batch_size,
+    x_batch_stride,
+    **params,
+):
+    del transpose_row_offsets, transpose_column_indices
+    return _raw_batched_reduction(
+        "spmv",
+        row_offsets,
+        column_indices,
+        x,
+        None,
+        batch_size=batch_size,
+        num_rows=params["num_rows"],
+        max_nnz_per_row=params["max_nnz_per_row"],
+        subwarp_size=params["subwarp_size"],
+        x_batch_stride=x_batch_stride,
     )
 
 
-batching.primitive_batchers[_unweighted_spmv_p] = _vmap_not_supported
-batching.primitive_batchers[_weighted_spmv_p] = _vmap_not_supported
+def _weighted_batched_impl(
+    values,
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    transpose_permutation,
+    x,
+    *,
+    batch_size,
+    values_batch_stride,
+    x_batch_stride,
+    values_batched,
+    x_batched,
+    **params,
+):
+    del transpose_row_offsets, transpose_column_indices, transpose_permutation
+    del values_batched, x_batched
+    return _raw_batched_reduction(
+        "spmv",
+        row_offsets,
+        column_indices,
+        x,
+        values,
+        batch_size=batch_size,
+        num_rows=params["num_rows"],
+        max_nnz_per_row=params["max_nnz_per_row"],
+        subwarp_size=params["subwarp_size"],
+        x_batch_stride=x_batch_stride,
+        values_batch_stride=values_batch_stride,
+    )
+
+
+def _unweighted_batched_abstract(
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    x,
+    *,
+    batch_size,
+    x_batch_stride,
+    **params,
+):
+    del x_batch_stride
+    assert x.shape == (batch_size, params["num_cols"])
+    assert row_offsets.shape == (params["num_rows"] + 1,)
+    assert transpose_row_offsets.shape == (params["num_cols"] + 1,)
+    assert column_indices.shape == transpose_column_indices.shape
+    assert row_offsets.dtype == column_indices.dtype == np.dtype(np.int32)
+    assert transpose_row_offsets.dtype == transpose_column_indices.dtype
+    assert x.dtype == np.dtype(np.float32)
+    return jax.core.ShapedArray(
+        (batch_size, params["num_rows"]), np.dtype(np.float32)
+    )
+
+
+def _weighted_batched_abstract(
+    values,
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    transpose_permutation,
+    x,
+    *,
+    batch_size,
+    values_batch_stride,
+    x_batch_stride,
+    values_batched,
+    x_batched,
+    **params,
+):
+    del values_batch_stride, x_batch_stride
+    expected_values = (
+        (batch_size, column_indices.shape[0])
+        if values_batched
+        else column_indices.shape
+    )
+    expected_x = (
+        (batch_size, params["num_cols"])
+        if x_batched
+        else (params["num_cols"],)
+    )
+    assert values.shape == expected_values
+    assert x.shape == expected_x
+    assert values.dtype == x.dtype == np.dtype(np.float32)
+    assert row_offsets.shape == (params["num_rows"] + 1,)
+    assert transpose_row_offsets.shape == (params["num_cols"] + 1,)
+    assert column_indices.shape == transpose_column_indices.shape
+    assert column_indices.shape == transpose_permutation.shape
+    return jax.core.ShapedArray(
+        (batch_size, params["num_rows"]), np.dtype(np.float32)
+    )
+
+
+_unweighted_batched_spmv_p = core.Primitive(
+    "springmv_csr_spmv_unweighted_batched"
+)
+_unweighted_batched_spmv_p.def_impl(_unweighted_batched_impl)
+_unweighted_batched_spmv_p.def_abstract_eval(_unweighted_batched_abstract)
+mlir.register_lowering(
+    _unweighted_batched_spmv_p,
+    mlir.lower_fun(_unweighted_batched_impl, multiple_results=False),
+    platform="cuda",
+)
+
+_weighted_batched_spmv_p = core.Primitive(
+    "springmv_csr_spmv_weighted_batched"
+)
+_weighted_batched_spmv_p.def_impl(_weighted_batched_impl)
+_weighted_batched_spmv_p.def_abstract_eval(_weighted_batched_abstract)
+mlir.register_lowering(
+    _weighted_batched_spmv_p,
+    mlir.lower_fun(_weighted_batched_impl, multiple_results=False),
+    platform="cuda",
+)
+
+
+def _unweighted_batcher(batched_args, batch_dimensions, **params):
+    if any(dimension is not None for dimension in batch_dimensions[:4]):
+        raise NotImplementedError(
+            "springmv.csr_spmv requires one shared CsrStructure; "
+            "batching CSR topology arrays is not supported"
+        )
+    x = jnp.moveaxis(batched_args[4], batch_dimensions[4], 0)
+    batch_size = x.shape[0]
+    return _unweighted_batched_spmv_p.bind(
+        *batched_args[:4],
+        x,
+        batch_size=batch_size,
+        x_batch_stride=params["num_cols"],
+        **params,
+    ), 0
+
+
+def _weighted_batcher(batched_args, batch_dimensions, **params):
+    if any(
+        batch_dimensions[index] is not None for index in range(1, 6)
+    ):
+        raise NotImplementedError(
+            "springmv.csr_spmv requires one shared CsrStructure; "
+            "batching CSR topology arrays is not supported"
+        )
+    values_batched = batch_dimensions[0] is not None
+    x_batched = batch_dimensions[6] is not None
+    mapped_sizes = [
+        argument.shape[dimension]
+        for argument, dimension in zip(
+            batched_args, batch_dimensions, strict=True
+        )
+        if dimension is not None
+    ]
+    if not mapped_sizes or len(set(mapped_sizes)) != 1:
+        raise ValueError("mapped SpringMV operands must have equal batch sizes")
+    batch_size = mapped_sizes[0]
+    values = (
+        jnp.moveaxis(batched_args[0], batch_dimensions[0], 0)
+        if values_batched
+        else batched_args[0]
+    )
+    x = (
+        jnp.moveaxis(batched_args[6], batch_dimensions[6], 0)
+        if x_batched
+        else batched_args[6]
+    )
+    return _weighted_batched_spmv_p.bind(
+        values,
+        *batched_args[1:6],
+        x,
+        batch_size=batch_size,
+        values_batch_stride=values.shape[-1] if values_batched else 0,
+        x_batch_stride=params["num_cols"] if x_batched else 0,
+        values_batched=values_batched,
+        x_batched=x_batched,
+        **params,
+    ), 0
+
+
+batching.primitive_batchers[_unweighted_spmv_p] = _unweighted_batcher
+batching.primitive_batchers[_weighted_spmv_p] = _weighted_batcher
 
 
 def _unweighted_bind(structure: CsrStructure, x, subwarp_size: int):
@@ -218,6 +421,36 @@ def _unweighted_jvp_x(
 
 
 ad.defjvp(_unweighted_spmv_p, None, None, None, None, _unweighted_jvp_x)
+
+
+def _unweighted_batched_jvp_x(
+    x_dot,
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    x,
+    **params,
+):
+    del x
+    return _unweighted_batched_spmv_p.bind(
+        row_offsets,
+        column_indices,
+        transpose_row_offsets,
+        transpose_column_indices,
+        x_dot,
+        **params,
+    )
+
+
+ad.defjvp(
+    _unweighted_batched_spmv_p,
+    None,
+    None,
+    None,
+    None,
+    _unweighted_batched_jvp_x,
+)
 
 
 def _unweighted_transpose(
@@ -317,11 +550,72 @@ ad.defjvp(
 )
 
 
+def _weighted_batched_jvp_values(
+    values_dot,
+    values,
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    transpose_permutation,
+    x,
+    **params,
+):
+    del values
+    return _weighted_batched_spmv_p.bind(
+        values_dot,
+        row_offsets,
+        column_indices,
+        transpose_row_offsets,
+        transpose_column_indices,
+        transpose_permutation,
+        x,
+        **params,
+    )
+
+
+def _weighted_batched_jvp_x(
+    x_dot,
+    values,
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    transpose_permutation,
+    x,
+    **params,
+):
+    del x
+    return _weighted_batched_spmv_p.bind(
+        values,
+        row_offsets,
+        column_indices,
+        transpose_row_offsets,
+        transpose_column_indices,
+        transpose_permutation,
+        x_dot,
+        **params,
+    )
+
+
+ad.defjvp(
+    _weighted_batched_spmv_p,
+    _weighted_batched_jvp_values,
+    None,
+    None,
+    None,
+    None,
+    None,
+    _weighted_batched_jvp_x,
+)
+
+
 @functools.cache
 def _input_vjp_call(num_cols: int):
     return jffi.ffi_call(
         "springmv_csr_spmv_input_vjp",
         jax.ShapeDtypeStruct((num_cols,), np.dtype(np.float32)),
+        vmap_method="sequential",
     )
 
 
@@ -330,6 +624,7 @@ def _input_vjp_scatter_call(num_cols: int):
     return jffi.ffi_call(
         "springmv_csr_spmv_input_vjp_scatter",
         jax.ShapeDtypeStruct((num_cols,), np.dtype(np.float32)),
+        vmap_method="sequential",
     )
 
 
@@ -338,6 +633,7 @@ def _values_vjp_call(num_nonzeros: int):
     return jffi.ffi_call(
         "springmv_csr_spmv_values_vjp",
         jax.ShapeDtypeStruct((num_nonzeros,), np.dtype(np.float32)),
+        vmap_method="sequential",
     )
 
 
@@ -414,6 +710,148 @@ def _weighted_transpose(
 
 
 ad.primitive_transposes[_weighted_spmv_p] = _weighted_transpose
+
+
+def _unweighted_batched_transpose(
+    cotangent,
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    x,
+    **params,
+):
+    if not ad.is_undefined_primal(x):
+        raise AssertionError("batched unweighted SpMV expected an unknown x")
+    cotangent = ad.instantiate_zeros(cotangent)
+
+    def transpose_one(current_cotangent):
+        return _raw_reduction(
+            "spmv",
+            transpose_row_offsets,
+            transpose_column_indices,
+            current_cotangent,
+            None,
+            num_rows=params["num_cols"],
+            max_nnz_per_row=params["transpose_max_nnz_per_row"],
+            subwarp_size=params["subwarp_size"],
+        )
+
+    input_cotangent = jax.lax.map(transpose_one, cotangent)
+    return (
+        row_offsets,
+        column_indices,
+        transpose_row_offsets,
+        transpose_column_indices,
+        input_cotangent,
+    )
+
+
+def _weighted_batched_transpose(
+    cotangent,
+    values,
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    transpose_permutation,
+    x,
+    **params,
+):
+    cotangent = ad.instantiate_zeros(cotangent)
+
+    if ad.is_undefined_primal(x):
+        if ad.is_undefined_primal(values):
+            raise AssertionError("weighted SpMV requires known values for dx")
+
+        def input_vjp_one(current_values, current_cotangent):
+            if params["input_vjp_strategy"] == "scatter":
+                return _input_vjp_scatter_call(params["num_cols"])(
+                    row_offsets,
+                    column_indices,
+                    current_values,
+                    current_cotangent,
+                    max_nnz_per_row=np.int32(params["max_nnz_per_row"]),
+                    subwarp_size=np.int32(params["subwarp_size"]),
+                )
+            return _input_vjp_call(params["num_cols"])(
+                transpose_row_offsets,
+                transpose_column_indices,
+                transpose_permutation,
+                current_values,
+                current_cotangent,
+                max_nnz_per_row=np.int32(
+                    params["transpose_max_nnz_per_row"]
+                ),
+                subwarp_size=np.int32(params["subwarp_size"]),
+            )
+
+        if params["values_batched"]:
+            input_cotangent = jax.lax.map(
+                lambda pair: input_vjp_one(pair[0], pair[1]),
+                (values, cotangent),
+            )
+        else:
+            input_cotangent = jax.lax.map(
+                lambda current_cotangent: input_vjp_one(
+                    values, current_cotangent
+                ),
+                cotangent,
+            )
+        if not params["x_batched"]:
+            input_cotangent = jnp.sum(input_cotangent, axis=0)
+        return (
+            values,
+            row_offsets,
+            column_indices,
+            transpose_row_offsets,
+            transpose_column_indices,
+            transpose_permutation,
+            input_cotangent,
+        )
+
+    if not ad.is_undefined_primal(values):
+        raise AssertionError("weighted SpMV expected unknown values or x")
+
+    def values_vjp_one(current_x, current_cotangent):
+        return _values_vjp_call(column_indices.shape[0])(
+            row_offsets,
+            column_indices,
+            current_x,
+            current_cotangent,
+            max_nnz_per_row=np.int32(params["max_nnz_per_row"]),
+            subwarp_size=np.int32(params["subwarp_size"]),
+        )
+
+    if params["x_batched"]:
+        values_cotangent = jax.lax.map(
+            lambda pair: values_vjp_one(pair[0], pair[1]),
+            (x, cotangent),
+        )
+    else:
+        values_cotangent = jax.lax.map(
+            lambda current_cotangent: values_vjp_one(x, current_cotangent),
+            cotangent,
+        )
+    if not params["values_batched"]:
+        values_cotangent = jnp.sum(values_cotangent, axis=0)
+    return (
+        values_cotangent,
+        row_offsets,
+        column_indices,
+        transpose_row_offsets,
+        transpose_column_indices,
+        transpose_permutation,
+        x,
+    )
+
+
+ad.primitive_transposes[
+    _unweighted_batched_spmv_p
+] = _unweighted_batched_transpose
+ad.primitive_transposes[
+    _weighted_batched_spmv_p
+] = _weighted_batched_transpose
 
 
 def csr_spmv(

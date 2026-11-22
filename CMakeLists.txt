@@ -96,6 +96,12 @@ if(SPRINGMV_BUILD_TESTS)
         springmv_transpose_tests
         PRIVATE SpringMV::springmv CUDA::cudart CUDA::cusparse)
     add_test(NAME springmv.csr_transpose COMMAND springmv_transpose_tests)
+
+    add_executable(springmv_batched_tests tests/test_csr_batched.cpp)
+    target_compile_features(springmv_batched_tests PRIVATE cxx_std_17)
+    target_link_libraries(
+        springmv_batched_tests PRIVATE SpringMV::springmv CUDA::cudart)
+    add_test(NAME springmv.csr_batched COMMAND springmv_batched_tests)
 endif()
 
 if(SPRINGMV_BUILD_BENCHMARKS)

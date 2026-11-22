@@ -16,6 +16,8 @@
 #include <cooperative_groups.h>
 #include <cuda_runtime_api.h>
 
+#include <limits>
+
 namespace springmv::detail {
 
 namespace cg = cooperative_groups;
@@ -73,6 +75,54 @@ __global__ __launch_bounds__(block_size) void csr_reduce_kernel(
     }
 }
 
+template <typename Policy, bool weighted, int subwarp_size>
+__global__ __launch_bounds__(block_size) void csr_reduce_batched_kernel(
+    std::int32_t batch_size, std::int32_t num_rows,
+    const std::int32_t* __restrict__ row_offsets,
+    const std::int32_t* __restrict__ column_indices,
+    const float* __restrict__ edge_values,
+    std::int32_t edge_values_batch_stride, const float* __restrict__ x,
+    std::int32_t x_batch_stride, float* __restrict__ y)
+{
+    auto tile = cg::tiled_partition<subwarp_size>(cg::this_thread_block());
+    const auto lane = static_cast<std::int32_t>(tile.thread_rank());
+    auto work = initial_row<subwarp_size>();
+    const auto stride = row_stride<subwarp_size>();
+    const auto total_rows = batch_size * num_rows;
+
+    for (; work < total_rows; work += stride) {
+        const auto batch = work / num_rows;
+        const auto row = work - batch * num_rows;
+        const auto* batch_x = x + batch * x_batch_stride;
+        const auto* batch_values =
+            weighted ? edge_values + batch * edge_values_batch_stride
+                     : nullptr;
+        auto state = Policy::identity();
+        const auto row_end = row_offsets[row + 1];
+        for (auto nz = row_offsets[row] + lane; nz < row_end;
+             nz += subwarp_size) {
+            const auto input = batch_x[column_indices[nz]];
+            if constexpr (weighted) {
+                state = Policy::accumulate_weighted(
+                    state, batch_values[nz], input);
+            } else {
+                state = Policy::accumulate_unweighted(state, input);
+            }
+        }
+
+#pragma unroll
+        for (int offset = subwarp_size / 2; offset > 0; offset /= 2) {
+            const auto right = Policy::shuffle_down(tile, state, offset);
+            if (lane + offset < subwarp_size) {
+                state = Policy::combine(state, right);
+            }
+        }
+        if (lane == 0) {
+            y[work] = Policy::finalize(state);
+        }
+    }
+}
+
 template <typename Policy, bool weighted, bool permuted, int subwarp_size>
 cudaError_t launch_csr_reduce(
     std::int32_t num_rows, const std::int32_t* row_offsets,
@@ -85,6 +135,23 @@ cudaError_t launch_csr_reduce(
         <<<grid, block_size, 0, stream>>>(num_rows, row_offsets,
                                           column_indices, edge_values, x, y,
                                           edge_permutation);
+    return cudaPeekAtLastError();
+}
+
+template <typename Policy, bool weighted, int subwarp_size>
+cudaError_t launch_csr_reduce_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    const std::int32_t* row_offsets, const std::int32_t* column_indices,
+    const float* edge_values, std::int32_t edge_values_batch_stride,
+    const float* x, std::int32_t x_batch_stride, float* y,
+    cudaStream_t stream) noexcept
+{
+    const auto total_rows = batch_size * num_rows;
+    const auto grid = grid_size<subwarp_size>(total_rows);
+    csr_reduce_batched_kernel<Policy, weighted, subwarp_size>
+        <<<grid, block_size, 0, stream>>>(
+            batch_size, num_rows, row_offsets, column_indices, edge_values,
+            edge_values_batch_stride, x, x_batch_stride, y);
     return cudaPeekAtLastError();
 }
 
@@ -129,6 +196,40 @@ cudaError_t dispatch_csr_reduce(
     }
 }
 
+template <typename Policy, bool weighted>
+cudaError_t dispatch_csr_reduce_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    const std::int32_t* row_offsets, const std::int32_t* column_indices,
+    const float* edge_values, std::int32_t edge_values_batch_stride,
+    const float* x, std::int32_t x_batch_stride, float* y,
+    CsrKernelOptions options, cudaStream_t stream) noexcept
+{
+    const auto subwarp = options.subwarp_size == 0
+                             ? select_subwarp_size(options.max_nnz_per_row)
+                             : options.subwarp_size;
+#define SPRINGMV_LAUNCH_BATCHED(size)                                       \
+    launch_csr_reduce_batched<Policy, weighted, size>(                       \
+        batch_size, num_rows, row_offsets, column_indices, edge_values,      \
+        edge_values_batch_stride, x, x_batch_stride, y, stream)
+    switch (subwarp) {
+    case 1:
+        return SPRINGMV_LAUNCH_BATCHED(1);
+    case 2:
+        return SPRINGMV_LAUNCH_BATCHED(2);
+    case 4:
+        return SPRINGMV_LAUNCH_BATCHED(4);
+    case 8:
+        return SPRINGMV_LAUNCH_BATCHED(8);
+    case 16:
+        return SPRINGMV_LAUNCH_BATCHED(16);
+    case 32:
+        return SPRINGMV_LAUNCH_BATCHED(32);
+    default:
+        return cudaErrorInvalidValue;
+    }
+#undef SPRINGMV_LAUNCH_BATCHED
+}
+
 template <typename Policy, bool weighted, bool permuted = false>
 cudaError_t csr_reduce(std::int32_t num_rows,
                        const std::int32_t* row_offsets,
@@ -157,6 +258,38 @@ cudaError_t csr_reduce(std::int32_t num_rows,
     return dispatch_csr_reduce<Policy, weighted, permuted>(
         num_rows, row_offsets, column_indices, edge_values, x, y, options,
         stream, edge_permutation);
+}
+
+template <typename Policy, bool weighted>
+cudaError_t csr_reduce_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    const std::int32_t* row_offsets, const std::int32_t* column_indices,
+    const float* edge_values, std::int32_t edge_values_batch_stride,
+    const float* x, std::int32_t x_batch_stride, float* y,
+    CsrKernelOptions options, cudaStream_t stream) noexcept
+{
+    if (batch_size < 0 || num_rows < 0 || edge_values_batch_stride < 0 ||
+        x_batch_stride < 0 || options.max_nnz_per_row < 0 ||
+        !valid_subwarp_size(options.subwarp_size) ||
+        (num_rows > 0 && batch_size >
+                             std::numeric_limits<std::int32_t>::max() /
+                                 num_rows)) {
+        return cudaErrorInvalidValue;
+    }
+    if (batch_size == 0 || num_rows == 0) {
+        return cudaSuccess;
+    }
+    if (row_offsets == nullptr || y == nullptr) {
+        return cudaErrorInvalidDevicePointer;
+    }
+    if (options.max_nnz_per_row > 0 &&
+        (column_indices == nullptr || x == nullptr ||
+         (weighted && edge_values == nullptr))) {
+        return cudaErrorInvalidDevicePointer;
+    }
+    return dispatch_csr_reduce_batched<Policy, weighted>(
+        batch_size, num_rows, row_offsets, column_indices, edge_values,
+        edge_values_batch_stride, x, x_batch_stride, y, options, stream);
 }
 
 }  // namespace springmv::detail

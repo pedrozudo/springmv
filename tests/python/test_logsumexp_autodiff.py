@@ -502,13 +502,127 @@ def test_empty_structure_autodiff(input_vjp_strategy: str) -> None:
     np.testing.assert_array_equal(input_cotangent, jnp.zeros_like(log_x))
 
 
-def test_vmap_is_explicitly_unsupported(
+def test_vmap_jvp_matches_pure_jax(
     structure: springmv.CsrStructure,
 ) -> None:
-    with pytest.raises(NotImplementedError, match="does not support jax.vmap"):
-        jax.vmap(lambda x: springmv.csr_logsumexp(structure, x))(
-            jnp.stack([LOG_X, LOG_X])
+    values = jnp.stack((LOG_VALUES, LOG_VALUES + 0.2))
+    inputs = jnp.stack((LOG_X, LOG_X - 0.3))
+    values_tangent = jnp.stack((VALUES_TANGENT, VALUES_TANGENT * 0.5))
+    input_tangent = jnp.stack((INPUT_TANGENT, INPUT_TANGENT * -0.25))
+
+    def spring_jvp(current_values, current_x, values_dot, x_dot):
+        return jax.jvp(
+            lambda v, x: springmv.csr_logsumexp(
+                structure, x, log_values=v
+            ),
+            (current_values, current_x),
+            (values_dot, x_dot),
         )
+
+    actual = jax.jit(jax.vmap(spring_jvp))(
+        values, inputs, values_tangent, input_tangent
+    )
+    expected = jax.vmap(
+        lambda current_values, current_x, values_dot, x_dot: jax.jvp(
+            _reference_logsumexp,
+            (current_values, current_x),
+            (values_dot, x_dot),
+        )
+    )(values, inputs, values_tangent, input_tangent)
+    np.testing.assert_allclose(actual[0], expected[0], rtol=4e-6)
+    np.testing.assert_allclose(actual[1], expected[1], rtol=5e-6, atol=5e-7)
+
+
+@pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
+def test_vmap_of_grad_matches_pure_jax(
+    structure: springmv.CsrStructure, input_vjp_strategy: str
+) -> None:
+    inputs = jnp.stack((LOG_X, LOG_X + 0.25, LOG_X - 0.5))
+
+    def spring_loss(log_x):
+        return jnp.vdot(
+            springmv.csr_logsumexp(
+                structure,
+                log_x,
+                log_values=LOG_VALUES,
+                input_vjp_strategy=input_vjp_strategy,
+            ),
+            OUTPUT_COTANGENT,
+        )
+
+    def reference_loss(log_x):
+        return jnp.vdot(
+            _reference_logsumexp(LOG_VALUES, log_x), OUTPUT_COTANGENT
+        )
+
+    actual = jax.jit(jax.vmap(jax.grad(spring_loss)))(inputs)
+    expected = jax.vmap(jax.grad(reference_loss))(inputs)
+    np.testing.assert_allclose(actual, expected, rtol=6e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
+def test_grad_through_vmap_with_shared_log_values(
+    structure: springmv.CsrStructure, input_vjp_strategy: str
+) -> None:
+    inputs = jnp.stack((LOG_X, LOG_X + 0.25, LOG_X - 0.5))
+
+    def spring_loss(log_values, log_inputs):
+        outputs = jax.vmap(
+            lambda log_x: springmv.csr_logsumexp(
+                structure,
+                log_x,
+                log_values=log_values,
+                input_vjp_strategy=input_vjp_strategy,
+            )
+        )(log_inputs)
+        return jnp.sum(outputs * OUTPUT_COTANGENT)
+
+    def reference_loss(log_values, log_inputs):
+        outputs = jax.vmap(
+            lambda log_x: _reference_logsumexp(log_values, log_x)
+        )(log_inputs)
+        return jnp.sum(outputs * OUTPUT_COTANGENT)
+
+    actual = jax.jit(jax.grad(spring_loss, argnums=(0, 1)))(
+        LOG_VALUES, inputs
+    )
+    expected = jax.grad(reference_loss, argnums=(0, 1))(LOG_VALUES, inputs)
+    np.testing.assert_allclose(actual[0], expected[0], rtol=8e-6, atol=1e-6)
+    np.testing.assert_allclose(actual[1], expected[1], rtol=8e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
+def test_vmap_grad_with_batched_values_and_inputs(
+    structure: springmv.CsrStructure, input_vjp_strategy: str
+) -> None:
+    values = jnp.stack((LOG_VALUES, LOG_VALUES + 0.2))
+    inputs = jnp.stack((LOG_X, LOG_X - 0.3))
+
+    def spring_loss(current_values, current_x):
+        return jnp.vdot(
+            springmv.csr_logsumexp(
+                structure,
+                current_x,
+                log_values=current_values,
+                input_vjp_strategy=input_vjp_strategy,
+            ),
+            OUTPUT_COTANGENT,
+        )
+
+    def reference_loss(current_values, current_x):
+        return jnp.vdot(
+            _reference_logsumexp(current_values, current_x),
+            OUTPUT_COTANGENT,
+        )
+
+    actual = jax.jit(
+        jax.vmap(jax.grad(spring_loss, argnums=(0, 1)))
+    )(values, inputs)
+    expected = jax.vmap(jax.grad(reference_loss, argnums=(0, 1)))(
+        values, inputs
+    )
+    np.testing.assert_allclose(actual[0], expected[0], rtol=8e-6, atol=1e-6)
+    np.testing.assert_allclose(actual[1], expected[1], rtol=8e-6, atol=1e-6)
 
 
 def test_invalid_input_vjp_strategy(

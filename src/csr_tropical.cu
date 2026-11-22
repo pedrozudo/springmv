@@ -7,6 +7,7 @@
 // are SpringMV additions. Full provenance is recorded in csr_reduce.cuh.
 
 #include "springmv/csr_tropical.hpp"
+#include "springmv/csr_batched.hpp"
 
 #include "csr_reduce.cuh"
 
@@ -115,6 +116,52 @@ cudaError_t csr_maxplus(std::int32_t num_rows,
     return detail::csr_reduce<MaxPlusPolicy, true>(
         num_rows, row_offsets, column_indices, edge_values, x, y, options,
         stream);
+}
+
+cudaError_t csr_minplus_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    const std::int32_t* row_offsets, const std::int32_t* column_indices,
+    const float* x, std::int32_t x_batch_stride, float* y,
+    CsrKernelOptions options, cudaStream_t stream) noexcept
+{
+    return detail::csr_reduce_batched<MinPlusPolicy, false>(
+        batch_size, num_rows, row_offsets, column_indices, nullptr, 0, x,
+        x_batch_stride, y, options, stream);
+}
+
+cudaError_t csr_minplus_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    const std::int32_t* row_offsets, const std::int32_t* column_indices,
+    const float* edge_values, std::int32_t values_batch_stride,
+    const float* x, std::int32_t x_batch_stride, float* y,
+    CsrKernelOptions options, cudaStream_t stream) noexcept
+{
+    return detail::csr_reduce_batched<MinPlusPolicy, true>(
+        batch_size, num_rows, row_offsets, column_indices, edge_values,
+        values_batch_stride, x, x_batch_stride, y, options, stream);
+}
+
+cudaError_t csr_maxplus_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    const std::int32_t* row_offsets, const std::int32_t* column_indices,
+    const float* x, std::int32_t x_batch_stride, float* y,
+    CsrKernelOptions options, cudaStream_t stream) noexcept
+{
+    return detail::csr_reduce_batched<MaxPlusPolicy, false>(
+        batch_size, num_rows, row_offsets, column_indices, nullptr, 0, x,
+        x_batch_stride, y, options, stream);
+}
+
+cudaError_t csr_maxplus_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    const std::int32_t* row_offsets, const std::int32_t* column_indices,
+    const float* edge_values, std::int32_t values_batch_stride,
+    const float* x, std::int32_t x_batch_stride, float* y,
+    CsrKernelOptions options, cudaStream_t stream) noexcept
+{
+    return detail::csr_reduce_batched<MaxPlusPolicy, true>(
+        batch_size, num_rows, row_offsets, column_indices, edge_values,
+        values_batch_stride, x, x_batch_stride, y, options, stream);
 }
 
 }  // namespace springmv

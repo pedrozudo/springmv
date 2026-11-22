@@ -89,7 +89,7 @@ and NaNs.
 
 python benchmarks/benchmark_jax.py
 python benchmarks/benchmark_jax.py --rows 1048576 --cols 1048576 \
-  --nnz-per-row 16 --iterations 50 --warmup 10
+  --nnz-per-row 16 --batch-size 8 --iterations 50 --warmup 10
 
 # Diagnose weighted arithmetic input-VJP alternatives.
 python benchmarks/benchmark_jax.py --rows 1048576 --cols 1048576 \
@@ -116,6 +116,12 @@ matvec, its log-sum-exp baseline uses a stable composition of
 precomputed row index for every nonzero, while SpringMV consumes CSR row
 offsets directly. Structure construction, row-index construction, and JIT
 compilation occur outside the timed region.
+
+`--batch-size` controls an additional `jax.vmap` section with shared edge
+weights. It reports fused arithmetic and log-sum-exp forward execution and
+weighted input VJPs with the transpose and atomic-scatter strategies as
+separate rows. The batched arithmetic baseline uses a native-JAX segment
+reduction.
 
 `--subwarp-size` selects an explicit SpringMV width for scheduling experiments.
 `--column-pattern` selects `uniform`, duplicate-heavy `diagonal`, concentrated
@@ -186,6 +192,34 @@ compiled = jax.jit(
 )
 compiled_result = compiled(log_x)
 ```
+
+The CSR topology remains shared under `jax.vmap`. Inputs and edge values may
+be mapped independently, so shared weights, per-example weights, or both
+per-example weights and inputs are supported:
+
+```python
+log_x_batch = jnp.stack([log_x, log_x + 0.5])
+log_values_batch = jnp.stack([log_values, log_values - 0.25])
+
+# One sparse matrix and one set of weights applied to a batch of inputs.
+shared_weights = jax.jit(
+    jax.vmap(lambda current_x: csr_logsumexp(
+        structure, current_x, log_values=log_values
+    ))
+)(log_x_batch)
+
+# Per-example edge weights and inputs, still sharing the CSR topology.
+batched_weights = jax.jit(
+    jax.vmap(lambda current_values, current_x: csr_logsumexp(
+        structure, current_x, log_values=current_values
+    ))
+)(log_values_batch, log_x_batch)
+```
+
+Mapped forward reductions use one fused batch-aware CUDA launch. Arithmetic
+and log-sum-exp `vmap` also compose with first-order `jvp`, VJP, and `grad`;
+their mapped backward rules currently reuse the existing per-example native
+kernels. Batched or ragged `CsrStructure` objects are not supported.
 
 `csr_spmv` accepts optional `values`, `csr_logsumexp` accepts optional
 `log_values`, and `csr_minplus`/`csr_maxplus` accept optional `edge_values`.
@@ -292,13 +326,13 @@ Supplying `values=` also returns transposed values. Temporary CUDA workspace is
 managed internally. When `return_permutation=False`, no permutation output is
 allocated.
 
-Current transformation support is deliberately narrow:
+Current transformation support is:
 
 | Operation | Eager | `jax.jit` | `jax.jvp` | VJP/`jax.grad` | `jax.vmap` |
 |---|---:|---:|---:|---:|---:|
-| Arithmetic CSR reduction | Yes | Yes | Yes | Yes | No |
-| Log-sum-exp CSR reduction | Yes | Yes | Yes | Yes | No |
-| Min-plus and max-plus reductions | Yes | Yes | No | No | No |
+| Arithmetic CSR reduction | Yes | Yes | Yes | Yes | Yes |
+| Log-sum-exp CSR reduction | Yes | Yes | Yes | Yes | Yes |
+| Min-plus and max-plus reductions | Yes | Yes | No | No | Yes |
 | CSR structure preprocessing | Yes | No | No | No | No |
 
 ## C++ API
@@ -308,6 +342,7 @@ Current transformation support is deliberately narrow:
 #include <springmv/csr_spmv_backward.hpp>
 #include <springmv/csr_logsumexp.hpp>
 #include <springmv/csr_logsumexp_backward.hpp>
+#include <springmv/csr_batched.hpp>
 #include <springmv/csr_tropical.hpp>
 #include <springmv/csr_transpose.hpp>
 
@@ -379,6 +414,12 @@ springmv::csr_logsumexp_input_vjp_scatter(
 springmv::csr_logsumexp_values_vjp(
     num_rows, d_row_offsets, d_column_indices, d_log_values, d_log_x,
     d_log_y, d_output_cotangent, d_log_values_cotangent,
+    options, stream);
+
+// Batch-major dense inputs and outputs. A zero values stride shares weights.
+springmv::csr_logsumexp_batched(
+    batch_size, num_rows, d_row_offsets, d_column_indices,
+    d_log_values, 0, d_log_x_batch, num_cols, d_log_y_batch,
     options, stream);
 ```
 

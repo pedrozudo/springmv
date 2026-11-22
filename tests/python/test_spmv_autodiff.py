@@ -333,6 +333,98 @@ def test_scatter_input_vjp_under_jit(
     )
 
 
+@pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
+def test_vmap_of_grad(
+    structure: springmv.CsrStructure, input_vjp_strategy: str
+) -> None:
+    inputs = jnp.stack((X, X + 0.25, X - 0.5))
+    differentiated = jax.jit(
+        jax.vmap(
+            jax.grad(
+                lambda x: jnp.vdot(
+                    springmv.csr_spmv(
+                        structure,
+                        x,
+                        values=VALUES,
+                        input_vjp_strategy=input_vjp_strategy,
+                    ),
+                    OUTPUT_COTANGENT,
+                )
+            )
+        )
+    )
+    actual = differentiated(inputs)
+    expected = jnp.broadcast_to(
+        _reference_input_vjp(OUTPUT_COTANGENT, VALUES), inputs.shape
+    )
+    np.testing.assert_allclose(actual, expected, rtol=3e-6)
+
+
+@pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
+def test_grad_through_vmap_with_shared_values(
+    structure: springmv.CsrStructure, input_vjp_strategy: str
+) -> None:
+    inputs = jnp.stack((X, X + 0.25, X - 0.5))
+
+    def loss(values, current_inputs):
+        outputs = jax.vmap(
+            lambda x: springmv.csr_spmv(
+                structure,
+                x,
+                values=values,
+                input_vjp_strategy=input_vjp_strategy,
+            )
+        )(current_inputs)
+        return jnp.sum(outputs * OUTPUT_COTANGENT)
+
+    values_cotangent, input_cotangents = jax.jit(
+        jax.grad(loss, argnums=(0, 1))
+    )(VALUES, inputs)
+    expected_values = jnp.sum(
+        OUTPUT_COTANGENT[None, _edge_rows()]
+        * inputs[:, COLUMN_INDICES],
+        axis=0,
+    )
+    expected_inputs = jnp.broadcast_to(
+        _reference_input_vjp(OUTPUT_COTANGENT, VALUES), inputs.shape
+    )
+    np.testing.assert_allclose(values_cotangent, expected_values, rtol=3e-6)
+    np.testing.assert_allclose(input_cotangents, expected_inputs, rtol=3e-6)
+
+
+@pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
+def test_vmap_grad_with_batched_values_and_inputs(
+    structure: springmv.CsrStructure, input_vjp_strategy: str
+) -> None:
+    values = jnp.stack((VALUES, VALUES + 0.5))
+    inputs = jnp.stack((X, X - 0.25))
+
+    def loss(current_values, current_x):
+        return jnp.vdot(
+            springmv.csr_spmv(
+                structure,
+                current_x,
+                values=current_values,
+                input_vjp_strategy=input_vjp_strategy,
+            ),
+            OUTPUT_COTANGENT,
+        )
+
+    actual = jax.jit(jax.vmap(jax.grad(loss, argnums=(0, 1))))(
+        values, inputs
+    )
+    expected_values = OUTPUT_COTANGENT[None, _edge_rows()] * inputs[
+        :, COLUMN_INDICES
+    ]
+    expected_inputs = jax.vmap(
+        lambda current_values: _reference_input_vjp(
+            OUTPUT_COTANGENT, current_values
+        )
+    )(values)
+    np.testing.assert_allclose(actual[0], expected_values, rtol=3e-6)
+    np.testing.assert_allclose(actual[1], expected_inputs, rtol=3e-6)
+
+
 def test_invalid_input_vjp_strategy(
     structure: springmv.CsrStructure,
 ) -> None:

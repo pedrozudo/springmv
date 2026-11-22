@@ -4,6 +4,7 @@
 #include "springmv/csr_spmv_backward.hpp"
 
 #include "csr_arithmetic_policy.cuh"
+#include "csr_input_vjp_scatter.cuh"
 #include "csr_kernel_common.cuh"
 #include "csr_reduce.cuh"
 
@@ -11,6 +12,32 @@
 
 namespace springmv {
 namespace {
+
+struct ArithmeticInputVjpPolicy {
+    using state_type = std::int32_t;
+
+    template <int subwarp_size, typename Tile>
+    __device__ static state_type prepare_row(
+        const Tile&, std::int32_t, std::int32_t, std::int32_t, std::int32_t,
+        const std::int32_t*, const float*, const float*,
+        const float*) noexcept
+    {
+        return {};
+    }
+
+    __device__ static float contribution(
+        state_type, std::int32_t row, std::int32_t edge, std::int32_t,
+        std::int32_t, const float* values, const float*, const float*,
+        const float* output_cotangent) noexcept
+    {
+        return values[edge] * output_cotangent[row];
+    }
+
+    static bool valid_optional_inputs(const float*, const float*) noexcept
+    {
+        return true;
+    }
+};
 
 template <int subwarp_size>
 __global__ __launch_bounds__(detail::block_size) void values_vjp_kernel(
@@ -97,6 +124,18 @@ cudaError_t csr_spmv_input_vjp(
         num_columns, transpose_row_offsets, transpose_column_indices, values,
         output_cotangent, input_cotangent, transpose_options, stream,
         transpose_permutation);
+}
+
+cudaError_t csr_spmv_input_vjp_scatter(
+    std::int32_t num_rows, std::int32_t num_columns,
+    const std::int32_t* row_offsets, const std::int32_t* column_indices,
+    const float* values,
+    const float* output_cotangent, float* input_cotangent,
+    CsrKernelOptions options, cudaStream_t stream) noexcept
+{
+    return detail::input_vjp_scatter<ArithmeticInputVjpPolicy>(
+        num_rows, num_columns, row_offsets, column_indices, values, nullptr,
+        nullptr, output_cotangent, input_cotangent, options, stream);
 }
 
 cudaError_t csr_spmv_values_vjp(

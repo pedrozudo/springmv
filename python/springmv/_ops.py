@@ -116,24 +116,6 @@ def _reduce(
     )
 
 
-def csr_logsumexp(
-    structure: CsrStructure,
-    log_x: Any,
-    *,
-    log_values: Any | None = None,
-    subwarp_size: int = 0,
-) -> jax.Array:
-    """Compute a float32/int32 CSR product over the log semiring."""
-    return _reduce(
-        "logsumexp",
-        structure,
-        log_x,
-        log_values,
-        edge_values_name="log_values",
-        subwarp_size=subwarp_size,
-    )
-
-
 def csr_minplus(
     structure: CsrStructure,
     x: Any,

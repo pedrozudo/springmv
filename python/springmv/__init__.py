@@ -1,6 +1,6 @@
 """JAX bindings for SpringMV's CUDA semiring CSR kernels."""
 
-from ._ops import csr_logsumexp as csr_logsumexp
+from ._logsumexp import csr_logsumexp as csr_logsumexp
 from ._ops import csr_maxplus as csr_maxplus
 from ._ops import csr_minplus as csr_minplus
 from ._spmv import csr_spmv as csr_spmv

@@ -31,12 +31,26 @@ PYBIND11_MODULE(_springmv, module)
             encapsulate(csr_spmv_weighted_handler());
         registrations["springmv_csr_spmv_input_vjp"] =
             encapsulate(csr_spmv_input_vjp_handler());
+        registrations["springmv_csr_spmv_input_vjp_scatter"] =
+            encapsulate(csr_spmv_input_vjp_scatter_handler());
         registrations["springmv_csr_spmv_values_vjp"] =
             encapsulate(csr_spmv_values_vjp_handler());
         registrations["springmv_csr_logsumexp_unweighted"] =
             encapsulate(csr_logsumexp_unweighted_handler());
         registrations["springmv_csr_logsumexp_weighted"] =
             encapsulate(csr_logsumexp_weighted_handler());
+        registrations["springmv_csr_logsumexp_jvp_unweighted"] =
+            encapsulate(csr_logsumexp_jvp_unweighted_handler());
+        registrations["springmv_csr_logsumexp_jvp_weighted"] =
+            encapsulate(csr_logsumexp_jvp_weighted_handler());
+        registrations["springmv_csr_logsumexp_input_vjp_unweighted"] =
+            encapsulate(csr_logsumexp_input_vjp_unweighted_handler());
+        registrations["springmv_csr_logsumexp_input_vjp_weighted"] =
+            encapsulate(csr_logsumexp_input_vjp_weighted_handler());
+        registrations["springmv_csr_logsumexp_input_vjp_scatter"] =
+            encapsulate(csr_logsumexp_input_vjp_scatter_handler());
+        registrations["springmv_csr_logsumexp_values_vjp"] =
+            encapsulate(csr_logsumexp_values_vjp_handler());
         registrations["springmv_csr_minplus_unweighted"] =
             encapsulate(csr_minplus_unweighted_handler());
         registrations["springmv_csr_minplus_weighted"] =

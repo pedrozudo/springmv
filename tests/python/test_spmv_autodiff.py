@@ -254,8 +254,11 @@ def test_jitted_grad_accepts_dynamic_structure(
 
 
 @pytest.mark.parametrize("subwarp_size", [0, 1, 2, 4, 8, 16, 32])
+@pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
 def test_vjp_all_subwarp_widths(
-    structure: springmv.CsrStructure, subwarp_size: int
+    structure: springmv.CsrStructure,
+    subwarp_size: int,
+    input_vjp_strategy: str,
 ) -> None:
     _, pullback = jax.vjp(
         lambda values, x: springmv.csr_spmv(
@@ -263,6 +266,7 @@ def test_vjp_all_subwarp_widths(
             x,
             values=values,
             subwarp_size=subwarp_size,
+            input_vjp_strategy=input_vjp_strategy,
         ),
         VALUES,
         X,
@@ -280,7 +284,8 @@ def test_vjp_all_subwarp_widths(
     )
 
 
-def test_empty_structure_autodiff() -> None:
+@pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
+def test_empty_structure_autodiff(input_vjp_strategy: str) -> None:
     structure = springmv.CsrStructure.from_arrays(
         jnp.array([0, 0, 0], dtype=jnp.int32),
         jnp.array([], dtype=jnp.int32),
@@ -292,7 +297,10 @@ def test_empty_structure_autodiff() -> None:
 
     _, pullback = jax.vjp(
         lambda current_values, current_x: springmv.csr_spmv(
-            structure, current_x, values=current_values
+            structure,
+            current_x,
+            values=current_values,
+            input_vjp_strategy=input_vjp_strategy,
         ),
         values,
         x,
@@ -300,6 +308,41 @@ def test_empty_structure_autodiff() -> None:
     values_cotangent, input_cotangent = pullback(output_cotangent)
     assert values_cotangent.shape == (0,)
     np.testing.assert_array_equal(input_cotangent, jnp.zeros_like(x))
+
+
+def test_scatter_input_vjp_under_jit(
+    structure: springmv.CsrStructure,
+) -> None:
+    differentiated = jax.jit(
+        jax.grad(
+            lambda x: jnp.vdot(
+                springmv.csr_spmv(
+                    structure,
+                    x,
+                    values=VALUES,
+                    input_vjp_strategy="scatter",
+                ),
+                OUTPUT_COTANGENT,
+            )
+        )
+    )
+    np.testing.assert_allclose(
+        differentiated(X),
+        _reference_input_vjp(OUTPUT_COTANGENT, VALUES),
+        rtol=3e-6,
+    )
+
+
+def test_invalid_input_vjp_strategy(
+    structure: springmv.CsrStructure,
+) -> None:
+    with pytest.raises(ValueError, match="input_vjp_strategy"):
+        springmv.csr_spmv(
+            structure,
+            X,
+            values=VALUES,
+            input_vjp_strategy="invalid",
+        )
 
 
 @pytest.mark.parametrize(

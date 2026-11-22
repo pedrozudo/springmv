@@ -57,9 +57,10 @@ def _weighted_impl(
     max_nnz_per_row,
     transpose_max_nnz_per_row,
     subwarp_size,
+    input_vjp_strategy,
 ):
     del transpose_row_offsets, transpose_column_indices, transpose_permutation
-    del num_cols, transpose_max_nnz_per_row
+    del num_cols, transpose_max_nnz_per_row, input_vjp_strategy
     return _raw_reduction(
         "spmv",
         row_offsets,
@@ -110,8 +111,10 @@ def _weighted_abstract(
     max_nnz_per_row,
     transpose_max_nnz_per_row,
     subwarp_size,
+    input_vjp_strategy,
 ):
     del max_nnz_per_row, transpose_max_nnz_per_row, subwarp_size
+    del input_vjp_strategy
     assert row_offsets.shape == (num_rows + 1,)
     assert transpose_row_offsets.shape == (num_cols + 1,)
     assert values.shape == column_indices.shape
@@ -170,7 +173,13 @@ def _unweighted_bind(structure: CsrStructure, x, subwarp_size: int):
     )
 
 
-def _weighted_bind(structure: CsrStructure, values, x, subwarp_size: int):
+def _weighted_bind(
+    structure: CsrStructure,
+    values,
+    x,
+    subwarp_size: int,
+    input_vjp_strategy: str,
+):
     return _weighted_spmv_p.bind(
         values,
         structure.row_offsets,
@@ -184,6 +193,7 @@ def _weighted_bind(structure: CsrStructure, values, x, subwarp_size: int):
         max_nnz_per_row=structure.max_nnz_per_row,
         transpose_max_nnz_per_row=structure.transpose_max_nnz_per_row,
         subwarp_size=subwarp_size,
+        input_vjp_strategy=input_vjp_strategy,
     )
 
 
@@ -316,6 +326,14 @@ def _input_vjp_call(num_cols: int):
 
 
 @functools.cache
+def _input_vjp_scatter_call(num_cols: int):
+    return jffi.ffi_call(
+        "springmv_csr_spmv_input_vjp_scatter",
+        jax.ShapeDtypeStruct((num_cols,), np.dtype(np.float32)),
+    )
+
+
+@functools.cache
 def _values_vjp_call(num_nonzeros: int):
     return jffi.ffi_call(
         "springmv_csr_spmv_values_vjp",
@@ -341,17 +359,27 @@ def _weighted_transpose(
     assert not ad.is_undefined_primal(transpose_permutation)
 
     if ad.is_undefined_primal(x):
-        input_cotangent = _input_vjp_call(params["num_cols"])(
-            transpose_row_offsets,
-            transpose_column_indices,
-            transpose_permutation,
-            values,
-            cotangent,
-            max_nnz_per_row=np.int32(
-                params["transpose_max_nnz_per_row"]
-            ),
-            subwarp_size=np.int32(params["subwarp_size"]),
-        )
+        if params["input_vjp_strategy"] == "scatter":
+            input_cotangent = _input_vjp_scatter_call(params["num_cols"])(
+                row_offsets,
+                column_indices,
+                values,
+                cotangent,
+                max_nnz_per_row=np.int32(params["max_nnz_per_row"]),
+                subwarp_size=np.int32(params["subwarp_size"]),
+            )
+        else:
+            input_cotangent = _input_vjp_call(params["num_cols"])(
+                transpose_row_offsets,
+                transpose_column_indices,
+                transpose_permutation,
+                values,
+                cotangent,
+                max_nnz_per_row=np.int32(
+                    params["transpose_max_nnz_per_row"]
+                ),
+                subwarp_size=np.int32(params["subwarp_size"]),
+            )
         return (
             values,
             row_offsets,
@@ -394,18 +422,33 @@ def csr_spmv(
     *,
     values: Any | None = None,
     subwarp_size: int = 0,
+    input_vjp_strategy: str = "transpose",
 ) -> jax.Array:
-    """Compute a first-order differentiable arithmetic CSR product."""
+    """Compute a first-order differentiable arithmetic CSR product.
+
+    ``input_vjp_strategy`` selects the weighted input-gradient implementation.
+    Unweighted input gradients always use transposed CSR.
+    """
     if not isinstance(structure, CsrStructure):
         raise TypeError("structure must be a CsrStructure")
     x_array = as_float_vector(x, "x")
     if x_array.shape[0] != structure.num_cols:
         raise ValueError("x length must equal structure.num_cols")
     subwarp = int(_validate_subwarp_size(subwarp_size))
+    if input_vjp_strategy not in ("transpose", "scatter"):
+        raise ValueError(
+            "input_vjp_strategy must be 'transpose' or 'scatter'"
+        )
 
     if values is None:
         return _unweighted_bind(structure, x_array, subwarp)
     values_array = as_float_vector(values, "values")
     if values_array.shape != structure.column_indices.shape:
         raise ValueError("values and column_indices must have equal shapes")
-    return _weighted_bind(structure, values_array, x_array, subwarp)
+    return _weighted_bind(
+        structure,
+        values_array,
+        x_array,
+        subwarp,
+        input_vjp_strategy,
+    )

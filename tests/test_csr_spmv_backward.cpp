@@ -148,6 +148,15 @@ void run_backward_case()
         CHECK_CUDA(cudaStreamSynchronize(stream));
         compare(d_input_cotangent.copy_to_host(), expected_input,
                 "weighted input VJP", subwarp);
+
+        CHECK_CUDA(springmv::csr_spmv_input_vjp_scatter(
+            num_rows, num_cols, d_row_offsets.data(),
+            d_column_indices.data(), d_values.data(),
+            d_output_cotangent.data(), d_input_cotangent.data(),
+            {3, subwarp}, stream));
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        compare(d_input_cotangent.copy_to_host(), expected_input,
+                "weighted input VJP scatter", subwarp);
         compare(d_values_cotangent.copy_to_host(), expected_values,
                 "values VJP", subwarp);
 
@@ -178,6 +187,12 @@ void run_empty_case()
             "empty input VJP", 0);
     CHECK_CUDA(springmv::csr_spmv_values_vjp(
         2, row_offsets.data(), nullptr, nullptr, nullptr, nullptr, {0, 0}));
+    CHECK_CUDA(springmv::csr_spmv_input_vjp_scatter(
+        2, 3, row_offsets.data(), nullptr, nullptr, nullptr,
+        input_cotangent.data(), {0, 0}));
+    CHECK_CUDA(cudaDeviceSynchronize());
+    compare(input_cotangent.copy_to_host(), {0.0F, 0.0F, 0.0F},
+            "empty input VJP scatter", 0);
 }
 
 }  // namespace

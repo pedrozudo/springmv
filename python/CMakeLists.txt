@@ -19,6 +19,7 @@ pybind11_add_module(
     _springmv MODULE
     src/module.cpp
     src/ffi_reductions.cpp
+    src/ffi_logsumexp_backward.cpp
     src/ffi_spmv_backward.cpp
     src/ffi_transpose.cpp)
 target_compile_features(_springmv PRIVATE cxx_std_17)

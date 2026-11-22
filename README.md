@@ -19,7 +19,7 @@ The current implementation intentionally supports only float32 values, int32
 CSR indices, and NVIDIA CUDA. It has no Ginkgo runtime dependency. A typed JAX
 FFI frontend exposes the same kernels without host copies and supports
 `jax.jit` plus first-order forward- and reverse-mode differentiation for
-arithmetic SpMV.
+arithmetic and log-sum-exp SpMV.
 
 Arithmetic, log-sum-exp, min-plus, and max-plus are compile-time policies over
 one internal CSR row-reduction engine. Scheduling, validation,
@@ -72,11 +72,13 @@ The tropical suite covers both semirings and weighting modes, empty-row
 identities, infinities, NaNs, duplicates, every subwarp width, zero-weight
 equivalence, permutation invariance, and min/max duality.
 
-The arithmetic backward suite checks weighted and unweighted input VJPs and
-edge-value VJPs for every subwarp width on a non-default CUDA stream. The JAX
-suite additionally covers JVP, VJP, `grad`, `value_and_grad`, JIT composition,
-dynamic `CsrStructure` arguments, duplicates, rectangular matrices, and empty
-structures.
+The arithmetic and log-sum-exp backward suites check weighted and unweighted
+JVPs and input VJPs plus edge-value VJPs for every subwarp width on a
+non-default CUDA stream. The JAX suite additionally compares derivatives with
+a pure-JAX oracle, checks the JVP/VJP adjoint identity and finite differences,
+and covers `grad`, `value_and_grad`, JIT composition, dynamic `CsrStructure`
+arguments, duplicates, rectangular matrices, empty structures, infinities,
+and NaNs.
 
 ## Benchmark
 
@@ -88,6 +90,10 @@ structures.
 python benchmarks/benchmark_jax.py
 python benchmarks/benchmark_jax.py --rows 1048576 --cols 1048576 \
   --nnz-per-row 16 --iterations 50 --warmup 10
+
+# Diagnose weighted arithmetic input-VJP alternatives.
+python benchmarks/benchmark_jax.py --rows 1048576 --cols 1048576 \
+  --nnz-per-row 16 --diagnose-input-vjp
 ```
 
 The benchmark uses CUDA events and reports weighted and unweighted arithmetic,
@@ -99,9 +105,26 @@ report GFLOP/s. Setup, validation, memory allocation, and transfers are outside
 the timed region.
 
 The JAX benchmark reports synchronized median, minimum, and maximum execution
-times for weighted forward execution, weighted and unweighted input VJPs, and
-the weighted value VJP. Structure construction and JIT compilation occur
-outside the timed region.
+times for arithmetic and log-sum-exp forward execution, JVPs, input VJPs, and
+value VJPs. Log-sum-exp reports both unweighted forward/input-VJP and weighted
+paths. Each SpringMV operation is paired with a native-JAX baseline and a
+speedup computed as `JAX median / SpringMV median`, so a value greater than one
+means SpringMV is faster. Arithmetic uses
+`jax.experimental.sparse.csr_matvec`. Because JAX has no sparse log-semiring
+matvec, its log-sum-exp baseline uses a stable composition of
+`jax.ops.segment_max` and `jax.ops.segment_sum`. The segment baseline stores a
+precomputed row index for every nonzero, while SpringMV consumes CSR row
+offsets directly. Structure construction, row-index construction, and JIT
+compilation occur outside the timed region.
+
+`--subwarp-size` selects an explicit SpringMV width for scheduling experiments.
+`--column-pattern` selects `uniform`, duplicate-heavy `diagonal`, concentrated
+`hotspot`, or maximally contended `single` column indices.
+`--diagnose-input-vjp` additionally compares the existing permutation-gather
+kernel, the new SpringMV atomic-scatter kernel, pre-reordered transpose values,
+dynamic value reordering, a native-JAX atomic scatter, and cuSPARSE transpose
+SpMV. The pre-reordered measurement excludes the one-time reorder; the dynamic
+measurement includes it.
 
 ## Python and JAX API
 
@@ -169,8 +192,9 @@ compiled_result = compiled(log_x)
 Omitting the corresponding array dispatches to a distinct unweighted FFI
 target.
 
-Arithmetic SpMV supports first-order forward- and reverse-mode
-differentiation. The weighted form differentiates both `x` and `values`:
+Arithmetic and log-sum-exp SpMV support first-order forward- and reverse-mode
+differentiation. Their weighted forms differentiate both the input and edge
+values:
 
 ```python
 from springmv import csr_spmv
@@ -192,12 +216,54 @@ loss, (values_grad, x_grad) = jax.value_and_grad(
     ).sum(),
     argnums=(0, 1),
 )(values, x)
+
+log_primal, log_tangent = jax.jvp(
+    lambda current_log_values, current_log_x: csr_logsumexp(
+        structure,
+        current_log_x,
+        log_values=current_log_values,
+    ),
+    (log_values, log_x),
+    (jnp.ones_like(log_values), jnp.ones_like(log_x)),
+)
+
+log_values_grad, log_x_grad = jax.grad(
+    lambda current_log_values, current_log_x: csr_logsumexp(
+        structure,
+        current_log_x,
+        log_values=current_log_values,
+    ).sum(),
+    argnums=(0, 1),
+)(log_values, log_x)
 ```
 
-The input VJP uses the transpose stored in `CsrStructure`. Weighted input
-gradients read original values through `transpose_permutation`, without
-atomics or a reordered-value temporary. Higher-order differentiation is not
-currently supported.
+Unweighted input VJPs always use the transpose stored in `CsrStructure`.
+Weighted arithmetic and log-sum-exp operations retain two implementations for
+benchmarking. `input_vjp_strategy="transpose"` reads original values through
+`transpose_permutation`; `input_vjp_strategy="scatter"` traverses original CSR
+and atomically accumulates into the input cotangent. Transpose is currently the
+default while the strategies are evaluated across matrix distributions:
+
+```python
+x_grad_scatter = jax.grad(
+    lambda current_x: csr_logsumexp(
+        structure,
+        current_x,
+        log_values=log_values,
+        input_vjp_strategy="scatter",
+    ).sum()
+)(log_x)
+```
+
+The transpose strategy is deterministic. Atomic scatter avoids permutation
+reads but its floating-point accumulation order is not deterministic.
+Higher-order differentiation is not currently supported.
+
+At extended-real boundary points, log-sum-exp derivatives use a deterministic
+symmetric convention. Multiple `+inf` terms split the derivative equally;
+when every term in a nonempty row is `-inf`, all terms split it equally. Empty
+rows have zero derivatives. A NaN term makes the row output and all derivatives
+associated with that row NaN.
 
 Values are deliberately not part of `CsrStructure`, so the same topology can
 be reused with changing or trainable weights. Calling `transpose()` returns a
@@ -230,7 +296,7 @@ Current transformation support is deliberately narrow:
 | Operation | Eager | `jax.jit` | `jax.jvp` | VJP/`jax.grad` | `jax.vmap` |
 |---|---:|---:|---:|---:|---:|
 | Arithmetic CSR reduction | Yes | Yes | Yes | Yes | No |
-| Log-sum-exp CSR reduction | Yes | Yes | Not yet | Not yet | No |
+| Log-sum-exp CSR reduction | Yes | Yes | Yes | Yes | No |
 | Min-plus and max-plus reductions | Yes | Yes | No | No | No |
 | CSR structure preprocessing | Yes | No | No | No | No |
 
@@ -240,6 +306,7 @@ Current transformation support is deliberately narrow:
 #include <springmv/csr_spmv.hpp>
 #include <springmv/csr_spmv_backward.hpp>
 #include <springmv/csr_logsumexp.hpp>
+#include <springmv/csr_logsumexp_backward.hpp>
 #include <springmv/csr_tropical.hpp>
 #include <springmv/csr_transpose.hpp>
 
@@ -278,10 +345,40 @@ springmv::csr_spmv_input_vjp(
     d_edge_permutation, d_values, d_output_cotangent,
     d_input_cotangent, transpose_options, stream);
 
+// Alternative weighted input VJP over original CSR using atomic scatter.
+springmv::csr_spmv_input_vjp_scatter(
+    num_rows, num_cols, d_row_offsets, d_column_indices, d_values,
+    d_output_cotangent, d_input_cotangent, options, stream);
+
 // Per-edge weighted value VJP.
 springmv::csr_spmv_values_vjp(
     num_rows, d_row_offsets, d_column_indices, d_x,
     d_output_cotangent, d_values_cotangent, options, stream);
+
+// Weighted log-sum-exp JVP. d_log_y is the previously computed primal.
+springmv::csr_logsumexp_jvp(
+    num_rows, d_row_offsets, d_column_indices, d_log_values, d_log_x,
+    d_log_y, d_log_values_tangent, d_log_x_tangent,
+    d_log_y_tangent, options, stream);
+
+// Weighted log-sum-exp input VJP using the precomputed transpose.
+springmv::csr_logsumexp_input_vjp(
+    num_cols, d_row_offsets, d_column_indices,
+    d_transposed_row_offsets, d_transposed_column_indices,
+    d_edge_permutation, d_log_values, d_log_x, d_log_y,
+    d_output_cotangent, d_log_x_cotangent,
+    transpose_options, stream);
+
+// Alternative weighted log-sum-exp input VJP using atomic scatter.
+springmv::csr_logsumexp_input_vjp_scatter(
+    num_rows, num_cols, d_row_offsets, d_column_indices,
+    d_log_values, d_log_x, d_log_y, d_output_cotangent,
+    d_log_x_cotangent, options, stream);
+
+springmv::csr_logsumexp_values_vjp(
+    num_rows, d_row_offsets, d_column_indices, d_log_values, d_log_x,
+    d_log_y, d_output_cotangent, d_log_values_cotangent,
+    options, stream);
 ```
 
 All pointers are device pointers. Calls enqueue work on the supplied CUDA

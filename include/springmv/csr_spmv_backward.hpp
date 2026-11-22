@@ -31,6 +31,21 @@ cudaError_t csr_spmv_input_vjp(
     cudaStream_t stream = nullptr) noexcept;
 
 /**
+ * Compute the weighted arithmetic input VJP by scattering original CSR edges.
+ *
+ * The output is initialized to zero before contributions are accumulated with
+ * atomic additions. Duplicate column indices are allowed. Floating-point
+ * accumulation order is not deterministic.
+ */
+cudaError_t csr_spmv_input_vjp_scatter(
+    std::int32_t num_rows, std::int32_t num_columns,
+    const std::int32_t* row_offsets,
+    const std::int32_t* column_indices, const float* values,
+    const float* output_cotangent, float* input_cotangent,
+    CsrKernelOptions options,
+    cudaStream_t stream = nullptr) noexcept;
+
+/**
  * Compute the edge-value VJP for weighted arithmetic SpMV.
  *
  * For an edge nz in row i and column j, this computes

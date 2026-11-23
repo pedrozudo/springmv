@@ -3,6 +3,7 @@
 from ._logsumexp import csr_logsumexp as csr_logsumexp
 from ._ops import csr_maxplus as csr_maxplus
 from ._ops import csr_minplus as csr_minplus
+from ._sampling import csr_logsumexp_sample as csr_logsumexp_sample
 from ._spmv import csr_spmv as csr_spmv
 from ._structure import CsrStructure as CsrStructure
 from ._transpose import csr_transpose as csr_transpose
@@ -10,6 +11,7 @@ from ._transpose import csr_transpose as csr_transpose
 __all__ = [
     "CsrStructure",
     "csr_logsumexp",
+    "csr_logsumexp_sample",
     "csr_maxplus",
     "csr_minplus",
     "csr_spmv",

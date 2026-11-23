@@ -10,6 +10,9 @@ import numpy as np
 
 
 def as_vector(value: Any, name: str, dtype: np.dtype[Any]) -> jax.Array:
+    declared_dtype = getattr(value, "dtype", None)
+    if declared_dtype is not None and np.dtype(declared_dtype) != dtype:
+        raise TypeError(f"{name} must have dtype {dtype.name}")
     array = jnp.asarray(value)
     if array.ndim != 1:
         raise ValueError(f"{name} must be one-dimensional")
@@ -24,6 +27,10 @@ def as_structure_array(value: Any, name: str) -> jax.Array:
 
 def as_float_vector(value: Any, name: str) -> jax.Array:
     return as_vector(value, name, np.dtype(np.float32))
+
+
+def as_bool_vector(value: Any, name: str) -> jax.Array:
+    return as_vector(value, name, np.dtype(np.bool_))
 
 
 def require_eager_cuda(*arrays: jax.Array, operation: str) -> None:

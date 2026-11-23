@@ -19,7 +19,8 @@ The current implementation intentionally supports only float32 values, int32
 CSR indices, and NVIDIA CUDA. It has no Ginkgo runtime dependency. A typed JAX
 FFI frontend exposes the same kernels without host copies and supports
 `jax.jit` plus first-order forward- and reverse-mode differentiation for
-arithmetic and log-sum-exp SpMV.
+arithmetic and log-sum-exp SpMV. It also exposes an atomic-free, non-
+differentiable Gumbel-max sampling operation for weighted log-sum-exp layers.
 
 Arithmetic, log-sum-exp, min-plus, and max-plus are compile-time policies over
 one internal CSR row-reduction engine. Scheduling, validation,
@@ -80,6 +81,12 @@ and covers `grad`, `value_and_grad`, JIT composition, dynamic `CsrStructure`
 arguments, duplicates, rectangular matrices, empty structures, infinities,
 and NaNs.
 
+The sampling suites independently test CSR Gumbel-max selection and
+transposed-CSR Boolean propagation. They cover inactive parents, empty rows and
+children, duplicate edges, exact ties, infinities, NaNs, every subwarp width,
+independently shared or batched weights/noise/activity, `jax.jit`, `jax.vmap`,
+and an empirical categorical-distribution check.
+
 ## Benchmark
 
 ```bash
@@ -90,6 +97,10 @@ and NaNs.
 python benchmarks/benchmark_jax.py
 python benchmarks/benchmark_jax.py --rows 1048576 --cols 1048576 \
   --nnz-per-row 16 --batch-size 8 --iterations 50 --warmup 10
+
+# Compare atomic-free sampling with an exact JAX segment/scatter formulation.
+python benchmarks/benchmark_sampling.py --rows 4096 --cols 4096 \
+  --nnz-per-row 8 --batch-sizes 1,8,32,128,1000,10000
 
 # Diagnose weighted arithmetic input-VJP alternatives.
 python benchmarks/benchmark_jax.py --rows 1048576 --cols 1048576 \
@@ -145,6 +156,20 @@ VJPs for single and batched inputs. Its detailed arithmetic section separates
 permutation-gather, pre-reordered transpose values, dynamic value reordering,
 and native-JAX scatter/CSR paths. The pre-reordered measurement excludes the
 one-time reorder; the dynamic measurement includes it.
+
+The sampling benchmark supplies identical pre-generated Gumbels to SpringMV
+and its JAX reference, verifies bitwise-equal Boolean outputs, and then times
+the complete selection-and-propagation operation. It reports the explicit
+weight, Gumbel, parent-activity, selected-child scratch, and output buffer
+sizes. The JAX
+reference exactly implements the same lowest-edge-index tie rule but
+materializes edge-wise segment/scatter intermediates. Use
+`--batched-weights` to give every batch element independent weights and
+`--column-pattern` to test uniform, duplicate-heavy, hotspot, or single-child
+topologies. Large batch sizes can require substantial memory because the
+chosen public API deliberately receives a materialized `(batch, nnz)` Gumbel
+buffer. Use `--springmv-only` for ceiling and scalability tests that should not
+compile or execute the generic JAX baseline.
 
 ## Python and JAX API
 
@@ -229,6 +254,54 @@ batched_weights = jax.jit(
     ))
 )(log_values_batch, log_x_batch)
 ```
+
+Weighted log-sum-exp layers can sample one child per active parent with
+caller-generated Gumbel noise. The output is a Boolean child-activity mask:
+
+```python
+from springmv import csr_logsumexp_sample
+
+active_parent = jnp.array([True, False], dtype=jnp.bool_)
+gumbels = jax.random.gumbel(
+    jax.random.key(7), (structure.num_nonzeros,), dtype=jnp.float32
+)
+
+active_child = jax.jit(
+    lambda noise: csr_logsumexp_sample(
+        structure,
+        log_values,
+        noise,
+        active_parent,
+    )
+)(gumbels)
+
+# The topology and weights may stay shared while noise and activity are mapped.
+keys = jax.random.split(jax.random.key(8), 128)
+gumbel_batch = jax.vmap(
+    lambda key: jax.random.gumbel(
+        key, (structure.num_nonzeros,), dtype=jnp.float32
+    )
+)(keys)
+active_parent_batch = jnp.broadcast_to(active_parent, (128, 2))
+active_child_batch = jax.jit(
+    jax.vmap(
+        lambda noise, active: csr_logsumexp_sample(
+            structure, log_values, noise, active
+        )
+    )
+)(gumbel_batch, active_parent_batch)
+```
+
+The caller supplies already transformed Gumbel variates, which keeps PRNG-key
+ownership explicit and reproducible. Weights, Gumbels, and parent activity can
+each be shared or independently mapped, provided mapped batch sizes agree.
+Selection reads weights in original CSR order and chooses exactly one edge per
+nonempty parent: the lowest original edge index wins exact ties. NaN scores are
+ignored; a row containing only NaNs or no edges selects nothing. Multiple
+`+inf` scores and rows containing only `-inf` follow the same tie rule.
+Propagation is a row-owned Boolean gather over the stored transpose and reads
+neither edge weights nor `transpose_permutation`; neither stage uses atomics.
+Sampling is intentionally non-differentiable.
 
 Vmapped forward reductions use one fused batch-aware CUDA launch. Arithmetic
 and log-sum-exp `vmap` also compose with first-order `jvp`, VJP, and `grad`;
@@ -348,6 +421,7 @@ Current transformation support is:
 | Arithmetic CSR reduction | Yes | Yes | Yes | Yes | Yes |
 | Log-sum-exp CSR reduction | Yes | Yes | Yes | Yes | Yes |
 | Min-plus and max-plus reductions | Yes | Yes | No | No | Yes |
+| Log-sum-exp sampling | Yes | Yes | No | No | Yes |
 | CSR structure preprocessing | Yes | No | No | No | No |
 
 ## C++ API
@@ -360,6 +434,7 @@ Current transformation support is:
 #include <springmv/csr_batched.hpp>
 #include <springmv/csr_tropical.hpp>
 #include <springmv/csr_transpose.hpp>
+#include <springmv/csr_sampling.hpp>
 
 springmv::CsrKernelOptions options{
     .max_nnz_per_row = max_row_length,
@@ -436,6 +511,16 @@ springmv::csr_logsumexp_batched(
     batch_size, num_rows, d_row_offsets, d_column_indices,
     d_log_values, 0, d_log_x_batch, num_cols, d_log_y_batch,
     options, stream);
+
+// Sampling uses externally generated Gumbels and caller-owned scratch.
+// selected_child_scratch contains num_rows int32 entries.
+springmv::csr_logsumexp_sample(
+    num_rows, num_cols,
+    d_row_offsets, d_column_indices,
+    d_transposed_row_offsets, d_transposed_column_indices,
+    d_log_values, d_gumbels, d_active_parent,
+    d_selected_child_scratch, d_active_child,
+    options, transpose_options, stream);
 ```
 
 All pointers are device pointers. Calls enqueue work on the supplied CUDA

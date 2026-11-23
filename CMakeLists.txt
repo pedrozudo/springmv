@@ -17,6 +17,7 @@ add_library(
     src/csr_spmv_backward.cu
     src/csr_logsumexp.cu
     src/csr_logsumexp_backward.cu
+    src/csr_sampling.cu
     src/csr_tropical.cu
     src/csr_transpose.cu)
 add_library(SpringMV::springmv ALIAS springmv)
@@ -102,6 +103,12 @@ if(SPRINGMV_BUILD_TESTS)
     target_link_libraries(
         springmv_batched_tests PRIVATE SpringMV::springmv CUDA::cudart)
     add_test(NAME springmv.csr_batched COMMAND springmv_batched_tests)
+
+    add_executable(springmv_sampling_tests tests/test_csr_sampling.cpp)
+    target_compile_features(springmv_sampling_tests PRIVATE cxx_std_17)
+    target_link_libraries(
+        springmv_sampling_tests PRIVATE SpringMV::springmv CUDA::cudart)
+    add_test(NAME springmv.csr_sampling COMMAND springmv_sampling_tests)
 endif()
 
 if(SPRINGMV_BUILD_BENCHMARKS)

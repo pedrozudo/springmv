@@ -24,6 +24,8 @@ XLA_FFI_Handler* csr_logsumexp_input_vjp_unweighted_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_input_vjp_weighted_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_input_vjp_scatter_handler() noexcept;
 XLA_FFI_Handler* csr_logsumexp_values_vjp_handler() noexcept;
+XLA_FFI_Handler* csr_logsumexp_sample_handler() noexcept;
+XLA_FFI_Handler* csr_logsumexp_sample_batched_handler() noexcept;
 XLA_FFI_Handler* csr_minplus_batched_unweighted_handler() noexcept;
 XLA_FFI_Handler* csr_minplus_batched_weighted_handler() noexcept;
 XLA_FFI_Handler* csr_maxplus_batched_unweighted_handler() noexcept;

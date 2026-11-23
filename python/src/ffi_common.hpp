@@ -21,9 +21,14 @@ using S32Buffer = ffi::BufferR1<ffi::DataType::S32>;
 using F32Buffer = ffi::BufferR1<ffi::DataType::F32>;
 using F32BufferR2 = ffi::BufferR2<ffi::DataType::F32>;
 using F32AnyBuffer = ffi::Buffer<ffi::DataType::F32>;
+using PredBuffer = ffi::BufferR1<ffi::DataType::PRED>;
+using PredBufferR2 = ffi::BufferR2<ffi::DataType::PRED>;
+using PredAnyBuffer = ffi::Buffer<ffi::DataType::PRED>;
 using S32Result = ffi::ResultBufferR1<ffi::DataType::S32>;
 using F32Result = ffi::ResultBufferR1<ffi::DataType::F32>;
 using F32ResultR2 = ffi::ResultBufferR2<ffi::DataType::F32>;
+using PredResult = ffi::ResultBufferR1<ffi::DataType::PRED>;
+using PredResultR2 = ffi::ResultBufferR2<ffi::DataType::PRED>;
 
 inline ffi::Error cuda_error(cudaError_t status, const char* operation)
 {

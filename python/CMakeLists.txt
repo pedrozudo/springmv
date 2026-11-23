@@ -1,5 +1,5 @@
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
-find_package(pybind11 CONFIG REQUIRED)
+find_package(nanobind CONFIG REQUIRED)
 
 execute_process(
     COMMAND
@@ -15,8 +15,8 @@ if(NOT SPRINGMV_JAX_INCLUDE_RESULT EQUAL 0)
         "${SPRINGMV_JAX_INCLUDE_ERROR}")
 endif()
 
-pybind11_add_module(
-    _springmv MODULE
+nanobind_add_module(
+    _springmv
     src/module.cpp
     src/ffi_reductions.cpp
     src/ffi_logsumexp_backward.cpp

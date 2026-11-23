@@ -3,28 +3,28 @@
 
 #include "ffi_handlers.hpp"
 
-#include <pybind11/pybind11.h>
+#include <nanobind/nanobind.h>
 
-namespace py = pybind11;
+namespace nb = nanobind;
 
 namespace springmv::jax_ffi {
 namespace {
 
-py::capsule encapsulate(XLA_FFI_Handler* handler)
+nb::capsule encapsulate(XLA_FFI_Handler* handler)
 {
-    return py::capsule(reinterpret_cast<void*>(handler));
+    return nb::capsule(reinterpret_cast<void*>(handler));
 }
 
 }  // namespace
 }  // namespace springmv::jax_ffi
 
-PYBIND11_MODULE(_springmv, module)
+NB_MODULE(_springmv, module)
 {
     using namespace springmv::jax_ffi;
 
     module.doc() = "Typed JAX FFI registrations for SpringMV";
     module.def("registrations", [] {
-        py::dict registrations;
+        nb::dict registrations;
         registrations["springmv_csr_spmv_unweighted"] =
             encapsulate(csr_spmv_unweighted_handler());
         registrations["springmv_csr_spmv_weighted"] =

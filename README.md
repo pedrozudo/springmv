@@ -1,8 +1,9 @@
 # SpringMV
 
-SpringMV is a CUDA-accelerated JAX library for sparse CSR reductions over
-multiple semirings. Its kernels run through JAX FFI without host copies and
-compose with `jax.jit` and `jax.vmap`.
+SpringMV stands for **Sparse Semiring Matrix-Vector multiplies**. It generalizes
+standard sparse matrix-vector multiplication from the arithmetic semiring to
+other useful semirings. SpringMV currently includes the standard arithmetic,
+log-sum-exp, min-plus, and max-plus semirings in weighted and unweighted form.
 
 | Operation | Weighted reduction | Unweighted reduction |
 |---|---|---|
@@ -11,10 +12,10 @@ compose with `jax.jit` and `jax.vmap`.
 | Min-plus | `min(edge_values + x)` | `min(x)` |
 | Max-plus | `max(edge_values + x)` | `max(x)` |
 
-SpringMV also provides atomic-free Gumbel-max sampling for weighted
-log-sum-exp layers. Arithmetic and log-sum-exp support first-order forward- and
-reverse-mode differentiation. Values are `float32`, CSR indices are `int32`,
-and the current backend is NVIDIA CUDA.
+The operations share a CUDA CSR row-reduction backend and run through JAX FFI
+without host copies. They compose with `jax.jit` and `jax.vmap`. The current
+implementation targets NVIDIA CUDA, uses `float32` values, and uses `int32` CSR
+indices.
 
 ## Installation
 

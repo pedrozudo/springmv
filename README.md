@@ -31,12 +31,14 @@ exposing templates in the public API.
 
 - CMake 3.24 or newer
 - A C++17 compiler
-- NVIDIA CUDA Toolkit with cuSPARSE
+- NVIDIA CUDA Toolkit (CUDA Runtime and CUB)
 - A CUDA-capable NVIDIA GPU
 - Ninja (recommended, but not required)
 
 The Python package additionally requires Python 3.10 or newer and a
-CUDA-enabled JAX installation.
+CUDA-enabled JAX installation. cuSPARSE is optional: it is used only by three
+native reference-test executables and the native comparison benchmark. The
+SpringMV library and JAX extension neither link nor load cuSPARSE.
 
 ## Build and test
 
@@ -57,17 +59,20 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCUDAToolkit_ROOT=/usr/local/cuda
 ```
 
-The arithmetic correctness suite compares SpringMV against cuSPARSE. The
-log-sum-exp suite uses a stable test-only long-double oracle, transformed
-double-precision cuSPARSE for moderate finite inputs, analytic edge cases, and
-metamorphic properties. Tests cover empty rows, infinities, NaNs, duplicate
-column indices, irregular row lengths, extreme values, every compiled subwarp
-width, automatic selection, non-default CUDA streams, and equivalence between
-unweighted overloads and unit arithmetic or zero log weights. The transpose
-suite compares weighted and structure-only results with cuSPARSE CSR-to-CSC
-and validates the
-edge permutation, deterministic ordering, rectangular matrices, duplicates,
-empty rows and columns, and workspace errors.
+When cuSPARSE is available, the arithmetic correctness suite compares SpringMV
+against it. The log-sum-exp suite uses a stable test-only long-double oracle,
+transformed double-precision cuSPARSE for moderate finite inputs, analytic edge
+cases, and metamorphic properties. Tests cover empty rows, infinities, NaNs,
+duplicate column indices, irregular row lengths, extreme values, every
+compiled subwarp width, automatic selection, non-default CUDA streams, and
+equivalence between unweighted overloads and unit arithmetic or zero log
+weights. The transpose suite compares weighted and structure-only results with
+cuSPARSE CSR-to-CSC and validates the edge permutation, deterministic ordering,
+rectangular matrices, duplicates, empty rows and columns, and workspace errors.
+These three cuSPARSE-backed executables are omitted automatically when the
+library is unavailable; all other native and Python tests remain enabled.
+They can also be disabled explicitly with
+`-DSPRINGMV_ENABLE_CUSPARSE_VALIDATION=OFF`.
 
 The tropical suite covers both semirings and weighting modes, empty-row
 identities, infinities, NaNs, duplicates, every subwarp width, zero-weight
@@ -107,13 +112,15 @@ python benchmarks/benchmark_jax.py --rows 1048576 --cols 1048576 \
   --nnz-per-row 16 --diagnose-input-vjp
 ```
 
-The benchmark uses CUDA events and reports weighted and unweighted arithmetic,
-arithmetic cuSPARSE, and weighted and unweighted SpringMV log-sum-exp over the
-same CSR data, followed by weighted and unweighted min-plus and max-plus. It
-reports median, minimum, and maximum kernel times plus GNNZ/s and effective
-GB/s. Unweighted byte counts exclude edge values. Arithmetic operations also
-report GFLOP/s. Setup, validation, memory allocation, and transfers are outside
-the timed region.
+When cuSPARSE is available, the native benchmark is built and uses CUDA events
+to report weighted and unweighted arithmetic, arithmetic cuSPARSE, and weighted
+and unweighted SpringMV log-sum-exp over the same CSR data, followed by
+weighted and unweighted min-plus and max-plus. It reports median, minimum, and
+maximum kernel times plus GNNZ/s and effective GB/s. Unweighted byte counts
+exclude edge values. Arithmetic operations also report GFLOP/s. Setup,
+validation, memory allocation, and transfers are outside the timed region. The
+native benchmark target is omitted when cuSPARSE is unavailable; the JAX and
+sampling benchmarks do not depend on it.
 
 The JAX benchmark reports synchronized median, minimum, and maximum execution
 times for arithmetic and log-sum-exp. It first reports the unweighted case and

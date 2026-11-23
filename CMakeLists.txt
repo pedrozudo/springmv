@@ -7,6 +7,10 @@ include(GNUInstallDirs)
 option(SPRINGMV_BUILD_TESTS "Build SpringMV correctness tests" ON)
 option(SPRINGMV_BUILD_BENCHMARKS "Build SpringMV benchmarks" ON)
 option(SPRINGMV_BUILD_JAX "Build the SpringMV JAX extension" OFF)
+option(
+    SPRINGMV_ENABLE_CUSPARSE_VALIDATION
+    "Build optional cuSPARSE-backed tests and benchmark"
+    ON)
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -45,11 +49,36 @@ endif()
 
 if(SPRINGMV_BUILD_TESTS)
     enable_testing()
-    add_executable(springmv_tests tests/test_csr_spmv.cpp)
-    target_compile_features(springmv_tests PRIVATE cxx_std_17)
-    target_link_libraries(
-        springmv_tests PRIVATE SpringMV::springmv CUDA::cudart CUDA::cusparse)
-    add_test(NAME springmv.csr_spmv COMMAND springmv_tests)
+
+    if(SPRINGMV_ENABLE_CUSPARSE_VALIDATION AND TARGET CUDA::cusparse)
+        add_executable(springmv_tests tests/test_csr_spmv.cpp)
+        target_compile_features(springmv_tests PRIVATE cxx_std_17)
+        target_link_libraries(
+            springmv_tests
+            PRIVATE SpringMV::springmv CUDA::cudart CUDA::cusparse)
+        add_test(NAME springmv.csr_spmv COMMAND springmv_tests)
+
+        add_executable(
+            springmv_logsumexp_tests tests/test_csr_logsumexp.cpp)
+        target_compile_features(springmv_logsumexp_tests PRIVATE cxx_std_17)
+        target_link_libraries(
+            springmv_logsumexp_tests
+            PRIVATE SpringMV::springmv CUDA::cudart CUDA::cusparse)
+        add_test(NAME springmv.csr_logsumexp COMMAND springmv_logsumexp_tests)
+
+        add_executable(
+            springmv_transpose_tests tests/test_csr_transpose.cpp)
+        target_compile_features(springmv_transpose_tests PRIVATE cxx_std_17)
+        target_link_libraries(
+            springmv_transpose_tests
+            PRIVATE SpringMV::springmv CUDA::cudart CUDA::cusparse)
+        add_test(NAME springmv.csr_transpose COMMAND springmv_transpose_tests)
+    else()
+        message(
+            STATUS
+            "cuSPARSE validation is unavailable or disabled; skipping "
+            "cuSPARSE-backed correctness tests")
+    endif()
 
     add_executable(
         springmv_spmv_backward_tests tests/test_csr_spmv_backward.cpp)
@@ -61,14 +90,6 @@ if(SPRINGMV_BUILD_TESTS)
     add_test(
         NAME springmv.csr_spmv_backward
         COMMAND springmv_spmv_backward_tests)
-
-    add_executable(
-        springmv_logsumexp_tests tests/test_csr_logsumexp.cpp)
-    target_compile_features(springmv_logsumexp_tests PRIVATE cxx_std_17)
-    target_link_libraries(
-        springmv_logsumexp_tests
-        PRIVATE SpringMV::springmv CUDA::cudart CUDA::cusparse)
-    add_test(NAME springmv.csr_logsumexp COMMAND springmv_logsumexp_tests)
 
     add_executable(
         springmv_logsumexp_backward_tests
@@ -90,14 +111,6 @@ if(SPRINGMV_BUILD_TESTS)
         PRIVATE SpringMV::springmv CUDA::cudart)
     add_test(NAME springmv.csr_tropical COMMAND springmv_tropical_tests)
 
-    add_executable(
-        springmv_transpose_tests tests/test_csr_transpose.cpp)
-    target_compile_features(springmv_transpose_tests PRIVATE cxx_std_17)
-    target_link_libraries(
-        springmv_transpose_tests
-        PRIVATE SpringMV::springmv CUDA::cudart CUDA::cusparse)
-    add_test(NAME springmv.csr_transpose COMMAND springmv_transpose_tests)
-
     add_executable(springmv_batched_tests tests/test_csr_batched.cpp)
     target_compile_features(springmv_batched_tests PRIVATE cxx_std_17)
     target_link_libraries(
@@ -112,12 +125,19 @@ if(SPRINGMV_BUILD_TESTS)
 endif()
 
 if(SPRINGMV_BUILD_BENCHMARKS)
-    add_executable(
-        springmv_benchmark benchmarks/benchmark_csr_spmv.cpp)
-    target_compile_features(springmv_benchmark PRIVATE cxx_std_17)
-    target_link_libraries(
-        springmv_benchmark
-        PRIVATE SpringMV::springmv CUDA::cudart CUDA::cusparse)
+    if(SPRINGMV_ENABLE_CUSPARSE_VALIDATION AND TARGET CUDA::cusparse)
+        add_executable(
+            springmv_benchmark benchmarks/benchmark_csr_spmv.cpp)
+        target_compile_features(springmv_benchmark PRIVATE cxx_std_17)
+        target_link_libraries(
+            springmv_benchmark
+            PRIVATE SpringMV::springmv CUDA::cudart CUDA::cusparse)
+    else()
+        message(
+            STATUS
+            "cuSPARSE validation is unavailable or disabled; skipping the "
+            "native comparison benchmark")
+    endif()
 endif()
 
 install(

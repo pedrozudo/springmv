@@ -34,9 +34,11 @@ def _unweighted_impl(
     max_nnz_per_row,
     transpose_max_nnz_per_row,
     subwarp_size,
+    input_vjp_strategy,
 ):
     del transpose_row_offsets, transpose_column_indices, num_cols
     del transpose_max_nnz_per_row
+    del input_vjp_strategy
     return _raw_reduction(
         "logsumexp",
         row_offsets,
@@ -91,8 +93,10 @@ def _unweighted_abstract(
     max_nnz_per_row,
     transpose_max_nnz_per_row,
     subwarp_size,
+    input_vjp_strategy,
 ):
     del max_nnz_per_row, transpose_max_nnz_per_row, subwarp_size
+    del input_vjp_strategy
     assert row_offsets.shape == (num_rows + 1,)
     assert transpose_row_offsets.shape == (num_cols + 1,)
     assert column_indices.shape == transpose_column_indices.shape
@@ -365,7 +369,12 @@ batching.primitive_batchers[_unweighted_logsumexp_p] = _unweighted_batcher
 batching.primitive_batchers[_weighted_logsumexp_p] = _weighted_batcher
 
 
-def _unweighted_bind(structure: CsrStructure, log_x, subwarp_size: int):
+def _unweighted_bind(
+    structure: CsrStructure,
+    log_x,
+    subwarp_size: int,
+    input_vjp_strategy: str,
+):
     return _unweighted_logsumexp_p.bind(
         structure.row_offsets,
         structure.column_indices,
@@ -377,6 +386,7 @@ def _unweighted_bind(structure: CsrStructure, log_x, subwarp_size: int):
         max_nnz_per_row=structure.max_nnz_per_row,
         transpose_max_nnz_per_row=structure.transpose_max_nnz_per_row,
         subwarp_size=subwarp_size,
+        input_vjp_strategy=input_vjp_strategy,
     )
 
 
@@ -428,9 +438,11 @@ def _unweighted_jvp_impl(
     max_nnz_per_row,
     transpose_max_nnz_per_row,
     subwarp_size,
+    input_vjp_strategy,
 ):
     del transpose_row_offsets, transpose_column_indices, num_cols
     del transpose_max_nnz_per_row
+    del input_vjp_strategy
     return _jvp_call(False, num_rows)(
         row_offsets,
         column_indices,
@@ -542,6 +554,89 @@ mlir.register_lowering(
     platform="cuda",
 )
 
+
+@functools.cache
+def _batched_unweighted_jvp_call(batch_size: int, num_rows: int):
+    return jffi.ffi_call(
+        "springmv_csr_logsumexp_jvp_batched_unweighted",
+        jax.ShapeDtypeStruct(
+            (batch_size, num_rows), np.dtype(np.float32)
+        ),
+    )
+
+
+def _unweighted_batched_jvp_impl(
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    log_x,
+    output,
+    input_tangent,
+    *,
+    batch_size,
+    x_batch_stride,
+    **params,
+):
+    del transpose_row_offsets, transpose_column_indices, x_batch_stride
+    return _batched_unweighted_jvp_call(
+        batch_size, params["num_rows"]
+    )(
+        row_offsets,
+        column_indices,
+        log_x,
+        output,
+        input_tangent,
+        batch_size=np.int32(batch_size),
+        num_columns=np.int32(params["num_cols"]),
+        max_nnz_per_row=np.int32(params["max_nnz_per_row"]),
+        subwarp_size=np.int32(params["subwarp_size"]),
+    )
+
+
+def _unweighted_batched_jvp_abstract(
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    log_x,
+    output,
+    input_tangent,
+    *,
+    batch_size,
+    x_batch_stride,
+    **params,
+):
+    del x_batch_stride
+    result = _unweighted_batched_abstract(
+        row_offsets,
+        column_indices,
+        transpose_row_offsets,
+        transpose_column_indices,
+        log_x,
+        batch_size=batch_size,
+        x_batch_stride=params["num_cols"],
+        **params,
+    )
+    assert output.shape == result.shape
+    assert input_tangent.shape == log_x.shape
+    assert output.dtype == input_tangent.dtype == log_x.dtype
+    return result
+
+
+_unweighted_batched_jvp_p = core.Primitive(
+    "springmv_csr_logsumexp_unweighted_batched_jvp"
+)
+_unweighted_batched_jvp_p.def_impl(_unweighted_batched_jvp_impl)
+_unweighted_batched_jvp_p.def_abstract_eval(
+    _unweighted_batched_jvp_abstract
+)
+mlir.register_lowering(
+    _unweighted_batched_jvp_p,
+    mlir.lower_fun(_unweighted_batched_jvp_impl, multiple_results=False),
+    platform="cuda",
+)
+
 _weighted_jvp_p = core.Primitive("springmv_csr_logsumexp_weighted_jvp")
 _weighted_jvp_p.def_impl(_weighted_jvp_impl)
 _weighted_jvp_p.def_abstract_eval(_weighted_jvp_abstract)
@@ -644,24 +739,15 @@ def _unweighted_batched_jvp_rule(primals, tangents, **params):
     ) = primals
     input_tangent = ad.instantiate_zeros(tangents[-1])
     output = _unweighted_batched_logsumexp_p.bind(*primals, **params)
-    single_params = dict(params)
-    single_params.pop("batch_size")
-    single_params.pop("x_batch_stride")
-
-    def tangent_one(index):
-        return _unweighted_jvp_p.bind(
-            row_offsets,
-            column_indices,
-            transpose_row_offsets,
-            transpose_column_indices,
-            log_x[index],
-            output[index],
-            input_tangent[index],
-            **single_params,
-        )
-
-    output_tangent = jax.lax.map(
-        tangent_one, jnp.arange(params["batch_size"], dtype=jnp.int32)
+    output_tangent = _unweighted_batched_jvp_p.bind(
+        row_offsets,
+        column_indices,
+        transpose_row_offsets,
+        transpose_column_indices,
+        log_x,
+        output,
+        input_tangent,
+        **params,
     )
     return output, output_tangent
 
@@ -752,6 +838,39 @@ def _input_vjp_scatter_call(num_cols: int):
 
 
 @functools.cache
+def _input_vjp_scatter_unweighted_call(num_cols: int):
+    return jffi.ffi_call(
+        "springmv_csr_logsumexp_input_vjp_scatter_unweighted",
+        jax.ShapeDtypeStruct((num_cols,), np.dtype(np.float32)),
+        vmap_method="sequential",
+    )
+
+
+@functools.cache
+def _input_vjp_batched_unweighted_call(
+    batch_size: int, num_cols: int
+):
+    return jffi.ffi_call(
+        "springmv_csr_logsumexp_input_vjp_batched_unweighted",
+        jax.ShapeDtypeStruct(
+            (batch_size, num_cols), np.dtype(np.float32)
+        ),
+    )
+
+
+@functools.cache
+def _input_vjp_scatter_batched_unweighted_call(
+    batch_size: int, num_cols: int
+):
+    return jffi.ffi_call(
+        "springmv_csr_logsumexp_input_vjp_scatter_batched_unweighted",
+        jax.ShapeDtypeStruct(
+            (batch_size, num_cols), np.dtype(np.float32)
+        ),
+    )
+
+
+@functools.cache
 def _values_vjp_call(num_nonzeros: int):
     return jffi.ffi_call(
         "springmv_csr_logsumexp_values_vjp",
@@ -780,17 +899,92 @@ def _unweighted_jvp_transpose(
     if not ad.is_undefined_primal(input_tangent):
         raise AssertionError("log-sum-exp transpose expected an unknown tangent")
     cotangent = ad.instantiate_zeros(cotangent)
-    input_cotangent = _input_vjp_call(False, params["num_cols"])(
+    if params["input_vjp_strategy"] == "scatter":
+        input_cotangent = _input_vjp_scatter_unweighted_call(
+            params["num_cols"]
+        )(
+            row_offsets,
+            column_indices,
+            log_x,
+            output,
+            cotangent,
+            max_nnz_per_row=np.int32(params["max_nnz_per_row"]),
+            subwarp_size=np.int32(params["subwarp_size"]),
+        )
+    else:
+        input_cotangent = _input_vjp_call(False, params["num_cols"])(
+            row_offsets,
+            column_indices,
+            transpose_row_offsets,
+            transpose_column_indices,
+            log_x,
+            output,
+            cotangent,
+            max_nnz_per_row=np.int32(
+                params["transpose_max_nnz_per_row"]
+            ),
+            subwarp_size=np.int32(params["subwarp_size"]),
+        )
+    return (None, None, None, None, None, None, input_cotangent)
+
+
+def _unweighted_batched_jvp_transpose(
+    cotangent,
+    row_offsets,
+    column_indices,
+    transpose_row_offsets,
+    transpose_column_indices,
+    log_x,
+    output,
+    input_tangent,
+    **params,
+):
+    assert not ad.is_undefined_primal(row_offsets)
+    assert not ad.is_undefined_primal(column_indices)
+    assert not ad.is_undefined_primal(transpose_row_offsets)
+    assert not ad.is_undefined_primal(transpose_column_indices)
+    assert not ad.is_undefined_primal(log_x)
+    assert not ad.is_undefined_primal(output)
+    if not ad.is_undefined_primal(input_tangent):
+        raise AssertionError(
+            "batched log-sum-exp transpose expected an unknown tangent"
+        )
+    cotangent = ad.instantiate_zeros(cotangent)
+    call_args = (
         row_offsets,
         column_indices,
-        transpose_row_offsets,
-        transpose_column_indices,
         log_x,
         output,
         cotangent,
-        max_nnz_per_row=np.int32(params["transpose_max_nnz_per_row"]),
+    )
+    call_attributes = dict(
+        batch_size=np.int32(params["batch_size"]),
         subwarp_size=np.int32(params["subwarp_size"]),
     )
+    if params["input_vjp_strategy"] == "scatter":
+        input_cotangent = _input_vjp_scatter_batched_unweighted_call(
+            params["batch_size"], params["num_cols"]
+        )(
+            *call_args,
+            max_nnz_per_row=np.int32(params["max_nnz_per_row"]),
+            **call_attributes,
+        )
+    else:
+        input_cotangent = _input_vjp_batched_unweighted_call(
+            params["batch_size"], params["num_cols"]
+        )(
+            row_offsets,
+            column_indices,
+            transpose_row_offsets,
+            transpose_column_indices,
+            log_x,
+            output,
+            cotangent,
+            max_nnz_per_row=np.int32(
+                params["transpose_max_nnz_per_row"]
+            ),
+            **call_attributes,
+        )
     return (None, None, None, None, None, None, input_cotangent)
 
 
@@ -876,6 +1070,9 @@ def _weighted_jvp_transpose(
 
 
 ad.primitive_transposes[_unweighted_jvp_p] = _unweighted_jvp_transpose
+ad.primitive_transposes[
+    _unweighted_batched_jvp_p
+] = _unweighted_batched_jvp_transpose
 ad.primitive_transposes[_weighted_jvp_p] = _weighted_jvp_transpose
 
 
@@ -889,8 +1086,8 @@ def csr_logsumexp(
 ) -> jax.Array:
     """Compute a first-order differentiable log-sum-exp CSR product.
 
-    ``input_vjp_strategy`` selects the weighted input-gradient implementation.
-    Unweighted input gradients always use transposed CSR.
+    ``input_vjp_strategy`` selects either transposed-CSR gather or original-CSR
+    atomic scatter for input gradients.
     """
     if not isinstance(structure, CsrStructure):
         raise TypeError("structure must be a CsrStructure")
@@ -904,7 +1101,9 @@ def csr_logsumexp(
         )
 
     if log_values is None:
-        return _unweighted_bind(structure, log_x_array, subwarp)
+        return _unweighted_bind(
+            structure, log_x_array, subwarp, input_vjp_strategy
+        )
     log_values_array = as_float_vector(log_values, "log_values")
     if log_values_array.shape != structure.column_indices.shape:
         raise ValueError(

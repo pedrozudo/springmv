@@ -361,6 +361,29 @@ def test_vmap_of_grad(
 
 
 @pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
+def test_unweighted_grad_through_vmap(
+    structure: springmv.CsrStructure, input_vjp_strategy: str
+) -> None:
+    inputs = jnp.stack((X, X + 0.25, X - 0.5))
+
+    def loss(current_inputs):
+        outputs = jax.vmap(
+            lambda x: springmv.csr_spmv(
+                structure,
+                x,
+                input_vjp_strategy=input_vjp_strategy,
+            )
+        )(current_inputs)
+        return jnp.sum(outputs * OUTPUT_COTANGENT)
+
+    actual = jax.jit(jax.grad(loss))(inputs)
+    expected = jnp.broadcast_to(
+        _reference_input_vjp(OUTPUT_COTANGENT, None), inputs.shape
+    )
+    np.testing.assert_allclose(actual, expected, rtol=3e-6)
+
+
+@pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
 def test_grad_through_vmap_with_shared_values(
     structure: springmv.CsrStructure, input_vjp_strategy: str
 ) -> None:

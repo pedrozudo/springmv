@@ -35,9 +35,9 @@ be returned. Unweighted backward differentiates the input. Weighted backward
 differentiates both the edge values and input; batched weighted measurements
 share one edge-value array and accumulate its gradient across the batch.
 
-Weighted forward-plus-backward measurements report both `scatter` and
-`transpose` input-gradient strategies. Forward-only execution is identical
-between the strategies and is reported once.
+Forward-plus-backward measurements report both `scatter` and `transpose`
+input-gradient strategies for weighted and unweighted products. Forward-only
+execution is identical between the strategies and is reported once.
 
 ### JAX baselines
 

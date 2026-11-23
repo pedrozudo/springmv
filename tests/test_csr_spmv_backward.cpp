@@ -107,6 +107,11 @@ void run_backward_case()
                                              -6.0F};
     const std::vector<float> expected_unweighted{-0.5F, 3.0F, 1.0F, -1.0F,
                                                   3.0F};
+    const std::vector<float> output_cotangent_batch{
+        0.5F, -2.0F, 3.0F, -1.0F, 1.0F, -4.0F, 6.0F, -2.0F};
+    const std::vector<float> expected_unweighted_batch{
+        -0.5F, 3.0F, 1.0F, -1.0F, 3.0F,
+        -1.0F, 6.0F, 2.0F, -2.0F, 6.0F};
     const std::vector<float> expected_values{0.5F, 1.5F, 1.5F, -6.0F,
                                               -3.0F, -1.0F, -4.0F};
 
@@ -122,6 +127,10 @@ void run_backward_case()
     DeviceBuffer<float> d_x(x.size());
     DeviceBuffer<float> d_output_cotangent(output_cotangent.size());
     DeviceBuffer<float> d_input_cotangent(num_cols);
+    DeviceBuffer<float> d_output_cotangent_batch(
+        output_cotangent_batch.size());
+    DeviceBuffer<float> d_input_cotangent_batch(
+        expected_unweighted_batch.size());
     DeviceBuffer<float> d_values_cotangent(values.size());
 
     d_row_offsets.copy_from(row_offsets);
@@ -132,6 +141,7 @@ void run_backward_case()
     d_values.copy_from(values);
     d_x.copy_from(x);
     d_output_cotangent.copy_from(output_cotangent);
+    d_output_cotangent_batch.copy_from(output_cotangent_batch);
 
     cudaStream_t stream{};
     CHECK_CUDA(cudaStreamCreate(&stream));
@@ -167,6 +177,21 @@ void run_backward_case()
         CHECK_CUDA(cudaStreamSynchronize(stream));
         compare(d_input_cotangent.copy_to_host(), expected_unweighted,
                 "unweighted input VJP", subwarp);
+
+        CHECK_CUDA(springmv::csr_spmv_input_vjp_scatter(
+            num_rows, num_cols, d_row_offsets.data(),
+            d_column_indices.data(), d_output_cotangent.data(),
+            d_input_cotangent.data(), {3, subwarp}, stream));
+        CHECK_CUDA(springmv::csr_spmv_input_vjp_scatter_batched(
+            2, num_rows, num_cols, d_row_offsets.data(),
+            d_column_indices.data(), d_output_cotangent_batch.data(),
+            d_input_cotangent_batch.data(), {3, subwarp}, stream));
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        compare(d_input_cotangent.copy_to_host(), expected_unweighted,
+                "unweighted input VJP scatter", subwarp);
+        compare(d_input_cotangent_batch.copy_to_host(),
+                expected_unweighted_batch,
+                "batched unweighted input VJP scatter", subwarp);
     }
     CHECK_CUDA(cudaStreamDestroy(stream));
 }

@@ -11,6 +11,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <limits>
 
 namespace springmv {
 namespace {
@@ -52,6 +53,7 @@ __device__ std::int32_t row_positive_infinity_count(
     return count;
 }
 
+template <bool weighted>
 struct LogSumExpInputVjpPolicy {
     using state_type = std::int32_t;
 
@@ -62,7 +64,7 @@ struct LogSumExpInputVjpPolicy {
         const std::int32_t* column_indices, const float* log_values,
         const float* log_x, const float* output) noexcept
     {
-        return row_positive_infinity_count<true, subwarp_size>(
+        return row_positive_infinity_count<weighted, subwarp_size>(
             tile, lane, row_begin, row_end, column_indices, log_values, log_x,
             output[row]);
     }
@@ -73,10 +75,16 @@ struct LogSumExpInputVjpPolicy {
         const float* log_values, const float* log_x, const float* output,
         const float* output_cotangent) noexcept
     {
-        const auto term = log_values[edge] + log_x[column];
+        const auto term = weighted ? log_values[edge] + log_x[column]
+                                   : log_x[column];
         const auto factor = detail::logsumexp_softmax_factor(
             term, output[row], row_length, infinity_count);
         return output_cotangent[row] * factor;
+    }
+
+    static bool valid_edge_values(const float* log_values) noexcept
+    {
+        return !weighted || log_values != nullptr;
     }
 
     static bool valid_optional_inputs(const float* log_x,
@@ -135,6 +143,59 @@ __global__ __launch_bounds__(detail::block_size) void jvp_kernel(
 }
 
 template <int subwarp_size>
+__global__ __launch_bounds__(detail::block_size) void jvp_batched_kernel(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns,
+    const std::int32_t* __restrict__ row_offsets,
+    const std::int32_t* __restrict__ column_indices,
+    const float* __restrict__ log_x, const float* __restrict__ output,
+    const float* __restrict__ input_tangent,
+    float* __restrict__ output_tangent)
+{
+    auto tile = cg::tiled_partition<subwarp_size>(cg::this_thread_block());
+    const auto lane = static_cast<std::int32_t>(tile.thread_rank());
+    auto work = detail::initial_row<subwarp_size>();
+    const auto stride = detail::row_stride<subwarp_size>();
+    const auto total_rows = batch_size * num_rows;
+
+    for (; work < total_rows; work += stride) {
+        const auto batch = work / num_rows;
+        const auto row = work - batch * num_rows;
+        const auto* batch_log_x =
+            log_x + static_cast<std::int64_t>(batch) * num_columns;
+        const auto* batch_input_tangent =
+            input_tangent + static_cast<std::int64_t>(batch) * num_columns;
+        const auto* batch_output =
+            output + static_cast<std::int64_t>(batch) * num_rows;
+        const auto row_begin = row_offsets[row];
+        const auto row_end = row_offsets[row + 1];
+        const auto row_length = row_end - row_begin;
+        const auto row_output = batch_output[row];
+        const auto infinity_count =
+            row_positive_infinity_count<false, subwarp_size>(
+                tile, lane, row_begin, row_end, column_indices, nullptr,
+                batch_log_x, row_output);
+
+        float sum{};
+        for (auto edge = row_begin + lane; edge < row_end;
+             edge += subwarp_size) {
+            const auto column = column_indices[edge];
+            const auto factor = detail::logsumexp_softmax_factor(
+                batch_log_x[column], row_output, row_length,
+                infinity_count);
+            sum += factor * batch_input_tangent[column];
+        }
+#pragma unroll
+        for (int offset = subwarp_size / 2; offset > 0; offset /= 2) {
+            sum += tile.shfl_down(sum, offset);
+        }
+        if (lane == 0) {
+            output_tangent[work] = sum;
+        }
+    }
+}
+
+template <int subwarp_size>
 __global__ __launch_bounds__(detail::block_size) void values_vjp_kernel(
     std::int32_t num_rows, const std::int32_t* __restrict__ row_offsets,
     const std::int32_t* __restrict__ column_indices,
@@ -164,6 +225,71 @@ __global__ __launch_bounds__(detail::block_size) void values_vjp_kernel(
             const auto factor = detail::logsumexp_softmax_factor(
                 term, row_output, row_length, infinity_count);
             values_cotangent[edge] = output_cotangent[row] * factor;
+        }
+    }
+}
+
+template <bool weighted>
+__device__ std::int32_t scalar_positive_infinity_count(
+    std::int32_t row_begin, std::int32_t row_end,
+    const std::int32_t* column_indices, const float* log_values,
+    const float* log_x) noexcept;
+
+template <int subwarp_size>
+__global__ __launch_bounds__(detail::block_size)
+void input_vjp_batched_kernel(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns,
+    const std::int32_t* __restrict__ row_offsets,
+    const std::int32_t* __restrict__ column_indices,
+    const std::int32_t* __restrict__ transpose_row_offsets,
+    const std::int32_t* __restrict__ transpose_column_indices,
+    const float* __restrict__ log_x, const float* __restrict__ output,
+    const float* __restrict__ output_cotangent,
+    float* __restrict__ input_cotangent)
+{
+    auto tile = cg::tiled_partition<subwarp_size>(cg::this_thread_block());
+    const auto lane = static_cast<std::int32_t>(tile.thread_rank());
+    auto work = detail::initial_row<subwarp_size>();
+    const auto stride = detail::row_stride<subwarp_size>();
+    const auto total_columns = batch_size * num_columns;
+
+    for (; work < total_columns; work += stride) {
+        const auto batch = work / num_columns;
+        const auto column = work - batch * num_columns;
+        const auto* batch_log_x =
+            log_x + static_cast<std::int64_t>(batch) * num_columns;
+        const auto output_offset =
+            static_cast<std::int64_t>(batch) * num_rows;
+        const auto* batch_output = output + output_offset;
+        const auto* batch_output_cotangent =
+            output_cotangent + output_offset;
+        float sum{};
+        const auto transpose_end = transpose_row_offsets[column + 1];
+        for (auto transpose_edge = transpose_row_offsets[column] + lane;
+             transpose_edge < transpose_end;
+             transpose_edge += subwarp_size) {
+            const auto row = transpose_column_indices[transpose_edge];
+            const auto row_begin = row_offsets[row];
+            const auto row_end = row_offsets[row + 1];
+            const auto row_output = batch_output[row];
+            auto infinity_count = std::int32_t{};
+            if (row_output == CUDART_INF_F) {
+                infinity_count = scalar_positive_infinity_count<false>(
+                    row_begin, row_end, column_indices, nullptr,
+                    batch_log_x);
+            }
+            const auto factor = detail::logsumexp_softmax_factor(
+                batch_log_x[column], row_output, row_end - row_begin,
+                infinity_count);
+            sum += batch_output_cotangent[row] * factor;
+        }
+#pragma unroll
+        for (int offset = subwarp_size / 2; offset > 0; offset /= 2) {
+            sum += tile.shfl_down(sum, offset);
+        }
+        if (lane == 0) {
+            input_cotangent[work] = sum;
         }
     }
 }
@@ -250,6 +376,22 @@ cudaError_t launch_jvp(
     return cudaPeekAtLastError();
 }
 
+template <int subwarp_size>
+cudaError_t launch_jvp_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices, const float* log_x,
+    const float* output, const float* input_tangent,
+    float* output_tangent, cudaStream_t stream) noexcept
+{
+    const auto total_rows = batch_size * num_rows;
+    const auto grid = detail::grid_size<subwarp_size>(total_rows);
+    jvp_batched_kernel<subwarp_size><<<grid, detail::block_size, 0, stream>>>(
+        batch_size, num_rows, num_columns, row_offsets, column_indices, log_x,
+        output, input_tangent, output_tangent);
+    return cudaPeekAtLastError();
+}
+
 template <bool weighted, int subwarp_size>
 cudaError_t launch_input_vjp(
     std::int32_t num_columns, const std::int32_t* row_offsets,
@@ -267,6 +409,26 @@ cudaError_t launch_input_vjp(
             num_columns, row_offsets, column_indices, transpose_row_offsets,
             transpose_column_indices, transpose_permutation, log_values,
             log_x, output, output_cotangent, input_cotangent);
+    return cudaPeekAtLastError();
+}
+
+template <int subwarp_size>
+cudaError_t launch_input_vjp_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices,
+    const std::int32_t* transpose_row_offsets,
+    const std::int32_t* transpose_column_indices, const float* log_x,
+    const float* output, const float* output_cotangent,
+    float* input_cotangent, cudaStream_t stream) noexcept
+{
+    const auto total_columns = batch_size * num_columns;
+    const auto grid = detail::grid_size<subwarp_size>(total_columns);
+    input_vjp_batched_kernel<subwarp_size>
+        <<<grid, detail::block_size, 0, stream>>>(
+            batch_size, num_rows, num_columns, row_offsets, column_indices,
+            transpose_row_offsets, transpose_column_indices, log_x, output,
+            output_cotangent, input_cotangent);
     return cudaPeekAtLastError();
 }
 
@@ -322,6 +484,25 @@ cudaError_t dispatch_jvp(
 #undef SPRINGMV_LAUNCH_JVP
 }
 
+cudaError_t dispatch_jvp_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices, const float* log_x,
+    const float* output, const float* input_tangent,
+    float* output_tangent, CsrKernelOptions options,
+    cudaStream_t stream) noexcept
+{
+    const auto subwarp = options.subwarp_size == 0
+                             ? select_subwarp_size(options.max_nnz_per_row)
+                             : options.subwarp_size;
+#define SPRINGMV_LAUNCH_BATCHED_JVP(size)                                    \
+    launch_jvp_batched<size>(batch_size, num_rows, num_columns, row_offsets,  \
+                             column_indices, log_x, output, input_tangent,   \
+                             output_tangent, stream)
+    SPRINGMV_DISPATCH_SUBWARP(SPRINGMV_LAUNCH_BATCHED_JVP)
+#undef SPRINGMV_LAUNCH_BATCHED_JVP
+}
+
 template <bool weighted>
 cudaError_t dispatch_input_vjp(
     std::int32_t num_columns, const std::int32_t* row_offsets,
@@ -343,6 +524,28 @@ cudaError_t dispatch_input_vjp(
         output, output_cotangent, input_cotangent, stream)
     SPRINGMV_DISPATCH_SUBWARP(SPRINGMV_LAUNCH_INPUT_VJP)
 #undef SPRINGMV_LAUNCH_INPUT_VJP
+}
+
+cudaError_t dispatch_input_vjp_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices,
+    const std::int32_t* transpose_row_offsets,
+    const std::int32_t* transpose_column_indices, const float* log_x,
+    const float* output, const float* output_cotangent,
+    float* input_cotangent, CsrKernelOptions options,
+    cudaStream_t stream) noexcept
+{
+    const auto subwarp = options.subwarp_size == 0
+                             ? select_subwarp_size(options.max_nnz_per_row)
+                             : options.subwarp_size;
+#define SPRINGMV_LAUNCH_BATCHED_INPUT_VJP(size)                              \
+    launch_input_vjp_batched<size>(                                          \
+        batch_size, num_rows, num_columns, row_offsets, column_indices,       \
+        transpose_row_offsets, transpose_column_indices, log_x, output,      \
+        output_cotangent, input_cotangent, stream)
+    SPRINGMV_DISPATCH_SUBWARP(SPRINGMV_LAUNCH_BATCHED_INPUT_VJP)
+#undef SPRINGMV_LAUNCH_BATCHED_INPUT_VJP
 }
 
 cudaError_t dispatch_values_vjp(
@@ -395,6 +598,36 @@ cudaError_t csr_logsumexp_jvp(
     return dispatch_jvp<false>(
         num_rows, row_offsets, column_indices, nullptr, log_x, output, nullptr,
         input_tangent, output_tangent, options, stream);
+}
+
+cudaError_t csr_logsumexp_jvp_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices, const float* log_x,
+    const float* output, const float* input_tangent,
+    float* output_tangent, CsrKernelOptions options,
+    cudaStream_t stream) noexcept
+{
+    const auto total_rows =
+        static_cast<std::int64_t>(batch_size) * num_rows;
+    if (batch_size < 0 || num_columns < 0 ||
+        total_rows > std::numeric_limits<std::int32_t>::max() ||
+        invalid_options(num_rows, options)) {
+        return cudaErrorInvalidValue;
+    }
+    if (batch_size == 0 || num_rows == 0) {
+        return cudaSuccess;
+    }
+    if (row_offsets == nullptr || output == nullptr ||
+        output_tangent == nullptr ||
+        (options.max_nnz_per_row > 0 &&
+         (column_indices == nullptr || log_x == nullptr ||
+          input_tangent == nullptr))) {
+        return cudaErrorInvalidDevicePointer;
+    }
+    return dispatch_jvp_batched(
+        batch_size, num_rows, num_columns, row_offsets, column_indices, log_x,
+        output, input_tangent, output_tangent, options, stream);
 }
 
 cudaError_t csr_logsumexp_jvp(
@@ -451,6 +684,39 @@ cudaError_t csr_logsumexp_input_vjp(
         output_cotangent, input_cotangent, transpose_options, stream);
 }
 
+cudaError_t csr_logsumexp_input_vjp_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices,
+    const std::int32_t* transpose_row_offsets,
+    const std::int32_t* transpose_column_indices, const float* log_x,
+    const float* output, const float* output_cotangent,
+    float* input_cotangent, CsrKernelOptions transpose_options,
+    cudaStream_t stream) noexcept
+{
+    const auto total_columns =
+        static_cast<std::int64_t>(batch_size) * num_columns;
+    if (batch_size < 0 || num_rows < 0 ||
+        total_columns > std::numeric_limits<std::int32_t>::max() ||
+        invalid_options(num_columns, transpose_options)) {
+        return cudaErrorInvalidValue;
+    }
+    if (batch_size == 0 || num_columns == 0) {
+        return cudaSuccess;
+    }
+    if (transpose_row_offsets == nullptr || input_cotangent == nullptr ||
+        (transpose_options.max_nnz_per_row > 0 &&
+         (row_offsets == nullptr || column_indices == nullptr ||
+          transpose_column_indices == nullptr || log_x == nullptr ||
+          output == nullptr || output_cotangent == nullptr))) {
+        return cudaErrorInvalidDevicePointer;
+    }
+    return dispatch_input_vjp_batched(
+        batch_size, num_rows, num_columns, row_offsets, column_indices,
+        transpose_row_offsets, transpose_column_indices, log_x, output,
+        output_cotangent, input_cotangent, transpose_options, stream);
+}
+
 cudaError_t csr_logsumexp_input_vjp(
     std::int32_t num_columns, const std::int32_t* row_offsets,
     const std::int32_t* column_indices,
@@ -489,9 +755,36 @@ cudaError_t csr_logsumexp_input_vjp_scatter(
     const float* output_cotangent, float* input_cotangent,
     CsrKernelOptions options, cudaStream_t stream) noexcept
 {
-    return detail::input_vjp_scatter<LogSumExpInputVjpPolicy>(
+    return detail::input_vjp_scatter<LogSumExpInputVjpPolicy<true>>(
         num_rows, num_columns, row_offsets, column_indices, log_values, log_x,
         output, output_cotangent, input_cotangent, options, stream);
+}
+
+cudaError_t csr_logsumexp_input_vjp_scatter(
+    std::int32_t num_rows, std::int32_t num_columns,
+    const std::int32_t* row_offsets, const std::int32_t* column_indices,
+    const float* log_x, const float* output,
+    const float* output_cotangent, float* input_cotangent,
+    CsrKernelOptions options, cudaStream_t stream) noexcept
+{
+    return detail::input_vjp_scatter<LogSumExpInputVjpPolicy<false>>(
+        num_rows, num_columns, row_offsets, column_indices, nullptr, log_x,
+        output, output_cotangent, input_cotangent, options, stream);
+}
+
+cudaError_t csr_logsumexp_input_vjp_scatter_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices, const float* log_x,
+    const float* output, const float* output_cotangent,
+    float* input_cotangent, CsrKernelOptions options,
+    cudaStream_t stream) noexcept
+{
+    return detail::input_vjp_scatter_batched<
+        LogSumExpInputVjpPolicy<false>>(
+        batch_size, num_rows, num_columns, row_offsets, column_indices,
+        nullptr, log_x, output, output_cotangent, input_cotangent, options,
+        stream);
 }
 
 cudaError_t csr_logsumexp_values_vjp(

@@ -13,6 +13,7 @@
 namespace springmv {
 namespace {
 
+template <bool weighted>
 struct ArithmeticInputVjpPolicy {
     using state_type = std::int32_t;
 
@@ -30,7 +31,15 @@ struct ArithmeticInputVjpPolicy {
         std::int32_t, const float* values, const float*, const float*,
         const float* output_cotangent) noexcept
     {
-        return values[edge] * output_cotangent[row];
+        if constexpr (weighted) {
+            return values[edge] * output_cotangent[row];
+        }
+        return output_cotangent[row];
+    }
+
+    static bool valid_edge_values(const float* values) noexcept
+    {
+        return !weighted || values != nullptr;
     }
 
     static bool valid_optional_inputs(const float*, const float*) noexcept
@@ -133,9 +142,34 @@ cudaError_t csr_spmv_input_vjp_scatter(
     const float* output_cotangent, float* input_cotangent,
     CsrKernelOptions options, cudaStream_t stream) noexcept
 {
-    return detail::input_vjp_scatter<ArithmeticInputVjpPolicy>(
+    return detail::input_vjp_scatter<ArithmeticInputVjpPolicy<true>>(
         num_rows, num_columns, row_offsets, column_indices, values, nullptr,
         nullptr, output_cotangent, input_cotangent, options, stream);
+}
+
+cudaError_t csr_spmv_input_vjp_scatter(
+    std::int32_t num_rows, std::int32_t num_columns,
+    const std::int32_t* row_offsets, const std::int32_t* column_indices,
+    const float* output_cotangent, float* input_cotangent,
+    CsrKernelOptions options, cudaStream_t stream) noexcept
+{
+    return detail::input_vjp_scatter<ArithmeticInputVjpPolicy<false>>(
+        num_rows, num_columns, row_offsets, column_indices, nullptr, nullptr,
+        nullptr, output_cotangent, input_cotangent, options, stream);
+}
+
+cudaError_t csr_spmv_input_vjp_scatter_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices, const float* output_cotangent,
+    float* input_cotangent, CsrKernelOptions options,
+    cudaStream_t stream) noexcept
+{
+    return detail::input_vjp_scatter_batched<
+        ArithmeticInputVjpPolicy<false>>(
+        batch_size, num_rows, num_columns, row_offsets, column_indices,
+        nullptr, nullptr, nullptr, output_cotangent, input_cotangent, options,
+        stream);
 }
 
 cudaError_t csr_spmv_values_vjp(

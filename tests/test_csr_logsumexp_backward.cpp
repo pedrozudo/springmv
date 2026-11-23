@@ -225,6 +225,17 @@ void run_case(const std::vector<std::int32_t>& row_offsets,
     const auto unweighted =
         reference(row_offsets, column_indices, nullptr, log_x, nullptr,
                   input_tangent, output_cotangent);
+    const auto duplicate = [](const std::vector<float>& values) {
+        auto result = values;
+        result.insert(result.end(), values.begin(), values.end());
+        return result;
+    };
+    const auto batched_log_x = duplicate(log_x);
+    const auto batched_output = duplicate(unweighted.output);
+    const auto batched_input_tangent = duplicate(input_tangent);
+    const auto batched_output_cotangent = duplicate(output_cotangent);
+    const auto batched_jvp = duplicate(unweighted.jvp);
+    const auto batched_input_vjp = duplicate(unweighted.input_vjp);
 
     DeviceBuffer<std::int32_t> d_row_offsets(row_offsets.size());
     DeviceBuffer<std::int32_t> d_column_indices(column_indices.size());
@@ -243,6 +254,15 @@ void run_case(const std::vector<std::int32_t>& row_offsets,
     DeviceBuffer<float> d_output_tangent(num_rows);
     DeviceBuffer<float> d_values_cotangent(log_values.size());
     DeviceBuffer<float> d_input_cotangent(num_columns);
+    DeviceBuffer<float> d_batched_log_x(batched_log_x.size());
+    DeviceBuffer<float> d_batched_output(batched_output.size());
+    DeviceBuffer<float> d_batched_input_tangent(
+        batched_input_tangent.size());
+    DeviceBuffer<float> d_batched_output_cotangent(
+        batched_output_cotangent.size());
+    DeviceBuffer<float> d_batched_output_tangent(batched_jvp.size());
+    DeviceBuffer<float> d_batched_input_cotangent(
+        batched_input_vjp.size());
 
     d_row_offsets.copy_from(row_offsets);
     d_column_indices.copy_from(column_indices);
@@ -254,6 +274,10 @@ void run_case(const std::vector<std::int32_t>& row_offsets,
     d_values_tangent.copy_from(values_tangent);
     d_input_tangent.copy_from(input_tangent);
     d_output_cotangent.copy_from(output_cotangent);
+    d_batched_log_x.copy_from(batched_log_x);
+    d_batched_output.copy_from(batched_output);
+    d_batched_input_tangent.copy_from(batched_input_tangent);
+    d_batched_output_cotangent.copy_from(batched_output_cotangent);
 
     cudaStream_t stream{};
     CHECK_CUDA(cudaStreamCreate(&stream));
@@ -311,6 +335,42 @@ void run_case(const std::vector<std::int32_t>& row_offsets,
                 "unweighted JVP", subwarp);
         compare(d_input_cotangent.copy_to_host(), unweighted.input_vjp,
                 "unweighted input VJP", subwarp);
+
+        CHECK_CUDA(springmv::csr_logsumexp_jvp_batched(
+            2, num_rows, num_columns, d_row_offsets.data(),
+            d_column_indices.data(), d_batched_log_x.data(),
+            d_batched_output.data(), d_batched_input_tangent.data(),
+            d_batched_output_tangent.data(), {max_row_length, subwarp},
+            stream));
+        CHECK_CUDA(springmv::csr_logsumexp_input_vjp_batched(
+            2, num_rows, num_columns, d_row_offsets.data(),
+            d_column_indices.data(), d_transpose_row_offsets.data(),
+            d_transpose_column_indices.data(), d_batched_log_x.data(),
+            d_batched_output.data(), d_batched_output_cotangent.data(),
+            d_batched_input_cotangent.data(),
+            {transpose_max_row_length, subwarp}, stream));
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        compare(d_batched_output_tangent.copy_to_host(), batched_jvp,
+                "batched unweighted JVP", subwarp);
+        compare(d_batched_input_cotangent.copy_to_host(), batched_input_vjp,
+                "batched unweighted input VJP", subwarp);
+
+        CHECK_CUDA(springmv::csr_logsumexp_input_vjp_scatter(
+            num_rows, num_columns, d_row_offsets.data(),
+            d_column_indices.data(), d_log_x.data(), d_output.data(),
+            d_output_cotangent.data(), d_input_cotangent.data(),
+            {max_row_length, subwarp}, stream));
+        CHECK_CUDA(springmv::csr_logsumexp_input_vjp_scatter_batched(
+            2, num_rows, num_columns, d_row_offsets.data(),
+            d_column_indices.data(), d_batched_log_x.data(),
+            d_batched_output.data(), d_batched_output_cotangent.data(),
+            d_batched_input_cotangent.data(), {max_row_length, subwarp},
+            stream));
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        compare(d_input_cotangent.copy_to_host(), unweighted.input_vjp,
+                "unweighted input VJP scatter", subwarp);
+        compare(d_batched_input_cotangent.copy_to_host(), batched_input_vjp,
+                "batched unweighted input VJP scatter", subwarp);
     }
     CHECK_CUDA(cudaStreamDestroy(stream));
 }

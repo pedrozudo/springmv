@@ -33,9 +33,11 @@ def _unweighted_impl(
     max_nnz_per_row,
     transpose_max_nnz_per_row,
     subwarp_size,
+    input_vjp_strategy,
 ):
     del transpose_row_offsets, transpose_column_indices, num_cols
     del transpose_max_nnz_per_row
+    del input_vjp_strategy
     return _raw_reduction(
         "spmv",
         row_offsets,
@@ -90,8 +92,10 @@ def _unweighted_abstract(
     max_nnz_per_row,
     transpose_max_nnz_per_row,
     subwarp_size,
+    input_vjp_strategy,
 ):
     del max_nnz_per_row, transpose_max_nnz_per_row, subwarp_size
+    del input_vjp_strategy
     assert row_offsets.shape == (num_rows + 1,)
     assert transpose_row_offsets.shape == (num_cols + 1,)
     assert column_indices.shape == transpose_column_indices.shape
@@ -361,7 +365,12 @@ batching.primitive_batchers[_unweighted_spmv_p] = _unweighted_batcher
 batching.primitive_batchers[_weighted_spmv_p] = _weighted_batcher
 
 
-def _unweighted_bind(structure: CsrStructure, x, subwarp_size: int):
+def _unweighted_bind(
+    structure: CsrStructure,
+    x,
+    subwarp_size: int,
+    input_vjp_strategy: str,
+):
     return _unweighted_spmv_p.bind(
         structure.row_offsets,
         structure.column_indices,
@@ -373,6 +382,7 @@ def _unweighted_bind(structure: CsrStructure, x, subwarp_size: int):
         max_nnz_per_row=structure.max_nnz_per_row,
         transpose_max_nnz_per_row=structure.transpose_max_nnz_per_row,
         subwarp_size=subwarp_size,
+        input_vjp_strategy=input_vjp_strategy,
     )
 
 
@@ -468,16 +478,27 @@ def _unweighted_transpose(
     assert not ad.is_undefined_primal(transpose_column_indices)
     if not ad.is_undefined_primal(x):
         raise AssertionError("unweighted SpMV transpose expected an unknown x")
-    input_cotangent = _raw_reduction(
-        "spmv",
-        transpose_row_offsets,
-        transpose_column_indices,
-        cotangent,
-        None,
-        num_rows=params["num_cols"],
-        max_nnz_per_row=params["transpose_max_nnz_per_row"],
-        subwarp_size=params["subwarp_size"],
-    )
+    if params["input_vjp_strategy"] == "scatter":
+        input_cotangent = _input_vjp_scatter_unweighted_call(
+            params["num_cols"]
+        )(
+            row_offsets,
+            column_indices,
+            cotangent,
+            max_nnz_per_row=np.int32(params["max_nnz_per_row"]),
+            subwarp_size=np.int32(params["subwarp_size"]),
+        )
+    else:
+        input_cotangent = _raw_reduction(
+            "spmv",
+            transpose_row_offsets,
+            transpose_column_indices,
+            cotangent,
+            None,
+            num_rows=params["num_cols"],
+            max_nnz_per_row=params["transpose_max_nnz_per_row"],
+            subwarp_size=params["subwarp_size"],
+        )
     return (
         row_offsets,
         column_indices,
@@ -629,6 +650,27 @@ def _input_vjp_scatter_call(num_cols: int):
 
 
 @functools.cache
+def _input_vjp_scatter_unweighted_call(num_cols: int):
+    return jffi.ffi_call(
+        "springmv_csr_spmv_input_vjp_scatter_unweighted",
+        jax.ShapeDtypeStruct((num_cols,), np.dtype(np.float32)),
+        vmap_method="sequential",
+    )
+
+
+@functools.cache
+def _input_vjp_scatter_batched_unweighted_call(
+    batch_size: int, num_cols: int
+):
+    return jffi.ffi_call(
+        "springmv_csr_spmv_input_vjp_scatter_batched_unweighted",
+        jax.ShapeDtypeStruct(
+            (batch_size, num_cols), np.dtype(np.float32)
+        ),
+    )
+
+
+@functools.cache
 def _values_vjp_call(num_nonzeros: int):
     return jffi.ffi_call(
         "springmv_csr_spmv_values_vjp",
@@ -724,20 +766,30 @@ def _unweighted_batched_transpose(
     if not ad.is_undefined_primal(x):
         raise AssertionError("batched unweighted SpMV expected an unknown x")
     cotangent = ad.instantiate_zeros(cotangent)
-
-    def transpose_one(current_cotangent):
-        return _raw_reduction(
+    if params["input_vjp_strategy"] == "scatter":
+        input_cotangent = _input_vjp_scatter_batched_unweighted_call(
+            params["batch_size"], params["num_cols"]
+        )(
+            row_offsets,
+            column_indices,
+            cotangent,
+            batch_size=np.int32(params["batch_size"]),
+            max_nnz_per_row=np.int32(params["max_nnz_per_row"]),
+            subwarp_size=np.int32(params["subwarp_size"]),
+        )
+    else:
+        input_cotangent = _raw_batched_reduction(
             "spmv",
             transpose_row_offsets,
             transpose_column_indices,
-            current_cotangent,
+            cotangent,
             None,
+            batch_size=params["batch_size"],
             num_rows=params["num_cols"],
             max_nnz_per_row=params["transpose_max_nnz_per_row"],
             subwarp_size=params["subwarp_size"],
+            x_batch_stride=params["num_rows"],
         )
-
-    input_cotangent = jax.lax.map(transpose_one, cotangent)
     return (
         row_offsets,
         column_indices,
@@ -864,8 +916,8 @@ def csr_spmv(
 ) -> jax.Array:
     """Compute a first-order differentiable arithmetic CSR product.
 
-    ``input_vjp_strategy`` selects the weighted input-gradient implementation.
-    Unweighted input gradients always use transposed CSR.
+    ``input_vjp_strategy`` selects either transposed-CSR gather or original-CSR
+    atomic scatter for input gradients.
     """
     if not isinstance(structure, CsrStructure):
         raise TypeError("structure must be a CsrStructure")
@@ -879,7 +931,9 @@ def csr_spmv(
         )
 
     if values is None:
-        return _unweighted_bind(structure, x_array, subwarp)
+        return _unweighted_bind(
+            structure, x_array, subwarp, input_vjp_strategy
+        )
     values_array = as_float_vector(values, "values")
     if values_array.shape != structure.column_indices.shape:
         raise ValueError("values and column_indices must have equal shapes")

@@ -45,6 +45,24 @@ cudaError_t csr_spmv_input_vjp_scatter(
     CsrKernelOptions options,
     cudaStream_t stream = nullptr) noexcept;
 
+/** Compute the unweighted arithmetic input VJP by atomic scatter. */
+cudaError_t csr_spmv_input_vjp_scatter(
+    std::int32_t num_rows, std::int32_t num_columns,
+    const std::int32_t* row_offsets,
+    const std::int32_t* column_indices,
+    const float* output_cotangent, float* input_cotangent,
+    CsrKernelOptions options,
+    cudaStream_t stream = nullptr) noexcept;
+
+/** Compute batched unweighted arithmetic input VJPs by atomic scatter. */
+cudaError_t csr_spmv_input_vjp_scatter_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices,
+    const float* output_cotangent, float* input_cotangent,
+    CsrKernelOptions options,
+    cudaStream_t stream = nullptr) noexcept;
+
 /**
  * Compute the edge-value VJP for weighted arithmetic SpMV.
  *

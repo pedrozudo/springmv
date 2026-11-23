@@ -533,6 +533,60 @@ def test_vmap_jvp_matches_pure_jax(
     np.testing.assert_allclose(actual[1], expected[1], rtol=5e-6, atol=5e-7)
 
 
+def test_unweighted_vmap_jvp_matches_pure_jax(
+    structure: springmv.CsrStructure,
+) -> None:
+    inputs = jnp.stack((LOG_X, LOG_X - 0.3, LOG_X + 0.1))
+    input_tangents = jnp.stack(
+        (INPUT_TANGENT, INPUT_TANGENT * -0.25, INPUT_TANGENT * 0.5)
+    )
+
+    def spring_jvp(current_x, x_dot):
+        return jax.jvp(
+            lambda x: springmv.csr_logsumexp(structure, x),
+            (current_x,),
+            (x_dot,),
+        )
+
+    actual = jax.jit(jax.vmap(spring_jvp))(inputs, input_tangents)
+    expected = jax.vmap(
+        lambda current_x, x_dot: jax.jvp(
+            lambda x: _reference_logsumexp(None, x),
+            (current_x,),
+            (x_dot,),
+        )
+    )(inputs, input_tangents)
+    np.testing.assert_allclose(actual[0], expected[0], rtol=4e-6)
+    np.testing.assert_allclose(actual[1], expected[1], rtol=5e-6, atol=5e-7)
+
+
+@pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
+def test_unweighted_grad_through_vmap_matches_pure_jax(
+    structure: springmv.CsrStructure, input_vjp_strategy: str
+) -> None:
+    inputs = jnp.stack((LOG_X, LOG_X + 0.25, LOG_X - 0.5))
+
+    def spring_loss(log_inputs):
+        outputs = jax.vmap(
+            lambda log_x: springmv.csr_logsumexp(
+                structure,
+                log_x,
+                input_vjp_strategy=input_vjp_strategy,
+            )
+        )(log_inputs)
+        return jnp.sum(outputs * OUTPUT_COTANGENT)
+
+    def reference_loss(log_inputs):
+        outputs = jax.vmap(
+            lambda log_x: _reference_logsumexp(None, log_x)
+        )(log_inputs)
+        return jnp.sum(outputs * OUTPUT_COTANGENT)
+
+    actual = jax.jit(jax.grad(spring_loss))(inputs)
+    expected = jax.grad(reference_loss)(inputs)
+    np.testing.assert_allclose(actual, expected, rtol=8e-6, atol=1e-6)
+
+
 @pytest.mark.parametrize("input_vjp_strategy", ["transpose", "scatter"])
 def test_vmap_of_grad_matches_pure_jax(
     structure: springmv.CsrStructure, input_vjp_strategy: str

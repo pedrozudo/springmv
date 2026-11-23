@@ -148,6 +148,17 @@ springmv::csr_spmv_input_vjp_scatter(
     options, stream);
 ```
 
+Omitting `d_values` selects the unweighted scatter overload. A fused batched
+unweighted overload is also available:
+
+```cpp
+springmv::csr_spmv_input_vjp_scatter_batched(
+    batch_size, num_rows, num_cols,
+    d_row_offsets, d_column_indices,
+    d_output_cotangent_batch, d_input_cotangent_batch,
+    options, stream);
+```
+
 Per-edge value VJP:
 
 ```cpp
@@ -175,7 +186,8 @@ springmv::csr_logsumexp_jvp(
 ```
 
 Log-sum-exp provides transpose and scatter input VJPs plus a per-edge value
-VJP in `csr_logsumexp_backward.hpp`.
+VJP in `csr_logsumexp_backward.hpp`. Its unweighted JVP, transpose VJP, and
+scatter VJP also have fused batched entry points.
 
 ## Sampling
 

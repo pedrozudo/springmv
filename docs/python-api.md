@@ -162,15 +162,19 @@ values_grad, x_grad = jax.grad(
 )(values, x)
 ```
 
-Unweighted input VJPs use the transpose stored in `CsrStructure`. Weighted
-arithmetic and log-sum-exp expose two input-gradient strategies:
+Arithmetic and log-sum-exp expose two input-gradient strategies for both
+weighted and unweighted products:
 
 - `input_vjp_strategy="scatter"` traverses original CSR and atomically
   accumulates into the input cotangent. This is the default because it avoids
   indirect edge-value reads.
 - `input_vjp_strategy="transpose"` gathers over transposed CSR and reads
-  original values through `transpose_permutation`. It is deterministic and can
-  be faster for matrices with high atomic contention.
+  weighted values through `transpose_permutation` when present. It is
+  deterministic and can be faster for matrices with high atomic contention.
+
+Both strategies use fused batched CUDA kernels for unweighted products under
+`jax.vmap`. Weighted batches currently share edge values and use mapped
+per-vector backward kernels.
 
 ```python
 x_grad = jax.grad(

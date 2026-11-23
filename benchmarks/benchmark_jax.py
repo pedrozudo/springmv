@@ -246,6 +246,15 @@ def main() -> None:
             structure,
             current_x,
             subwarp_size=args.subwarp_size,
+            input_vjp_strategy="scatter",
+        )
+
+    def springmv_arithmetic_unweighted_transpose(current_x):
+        return springmv.csr_spmv(
+            structure,
+            current_x,
+            subwarp_size=args.subwarp_size,
+            input_vjp_strategy="transpose",
         )
 
     def springmv_arithmetic_weighted(current_values, current_x):
@@ -271,6 +280,15 @@ def main() -> None:
             structure,
             current_x,
             subwarp_size=args.subwarp_size,
+            input_vjp_strategy="scatter",
+        )
+
+    def springmv_logsumexp_unweighted_transpose(current_x):
+        return springmv.csr_logsumexp(
+            structure,
+            current_x,
+            subwarp_size=args.subwarp_size,
+            input_vjp_strategy="transpose",
         )
 
     def springmv_logsumexp_weighted(current_values, current_x):
@@ -298,10 +316,17 @@ def main() -> None:
 
     arithmetic_unweighted_forward = jax.jit(springmv_arithmetic_unweighted)
     jax_arithmetic_unweighted_forward = jax.jit(jax_arithmetic_unweighted)
-    arithmetic_unweighted_forward_backward = jax.jit(
+    arithmetic_unweighted_forward_backward_scatter = jax.jit(
         jax.grad(
             lambda current_x: squared_output_loss(
                 springmv_arithmetic_unweighted, current_x
+            )
+        )
+    )
+    arithmetic_unweighted_forward_backward_transpose = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                springmv_arithmetic_unweighted_transpose, current_x
             )
         )
     )
@@ -316,10 +341,17 @@ def main() -> None:
     jax_logsumexp_unweighted_forward = jax.jit(
         jax_segment_logsumexp_unweighted
     )
-    logsumexp_unweighted_forward_backward = jax.jit(
+    logsumexp_unweighted_forward_backward_scatter = jax.jit(
         jax.grad(
             lambda current_x: squared_output_loss(
                 springmv_logsumexp_unweighted, current_x
+            )
+        )
+    )
+    logsumexp_unweighted_forward_backward_transpose = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                springmv_logsumexp_unweighted_transpose, current_x
             )
         )
     )
@@ -391,11 +423,17 @@ def main() -> None:
     springmv_batched_arithmetic_unweighted = jax.vmap(
         springmv_arithmetic_unweighted
     )
+    springmv_batched_arithmetic_unweighted_transpose = jax.vmap(
+        springmv_arithmetic_unweighted_transpose
+    )
     jax_batched_arithmetic_unweighted = jax.vmap(
         jax_segment_spmv_unweighted
     )
     springmv_batched_logsumexp_unweighted = jax.vmap(
         springmv_logsumexp_unweighted
+    )
+    springmv_batched_logsumexp_unweighted_transpose = jax.vmap(
+        springmv_logsumexp_unweighted_transpose
     )
     jax_batched_logsumexp_unweighted = jax.vmap(
         jax_segment_logsumexp_unweighted
@@ -407,10 +445,18 @@ def main() -> None:
     batched_jax_arithmetic_unweighted_forward = jax.jit(
         jax_batched_arithmetic_unweighted
     )
-    batched_arithmetic_unweighted_forward_backward = jax.jit(
+    batched_arithmetic_unweighted_forward_backward_scatter = jax.jit(
         jax.grad(
             lambda current_x: squared_output_loss(
                 springmv_batched_arithmetic_unweighted, current_x
+            )
+        )
+    )
+    batched_arithmetic_unweighted_forward_backward_transpose = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                springmv_batched_arithmetic_unweighted_transpose,
+                current_x,
             )
         )
     )
@@ -427,10 +473,18 @@ def main() -> None:
     batched_jax_logsumexp_unweighted_forward = jax.jit(
         jax_batched_logsumexp_unweighted
     )
-    batched_logsumexp_unweighted_forward_backward = jax.jit(
+    batched_logsumexp_unweighted_forward_backward_scatter = jax.jit(
         jax.grad(
             lambda current_x: squared_output_loss(
                 springmv_batched_logsumexp_unweighted, current_x
+            )
+        )
+    )
+    batched_logsumexp_unweighted_forward_backward_transpose = jax.jit(
+        jax.grad(
+            lambda current_x: squared_output_loss(
+                springmv_batched_logsumexp_unweighted_transpose,
+                current_x,
             )
         )
     )
@@ -708,8 +762,16 @@ def main() -> None:
         jax_label="JAX CSR",
     )
     _benchmark_pair(
+        "single arithmetic forward + backward (scatter)",
+        lambda: arithmetic_unweighted_forward_backward_scatter(x),
+        lambda: jax_arithmetic_unweighted_forward_backward(x),
+        args.warmup,
+        args.iterations,
+        jax_label="JAX CSR",
+    )
+    _benchmark_pair(
         "single arithmetic forward + backward (transpose)",
-        lambda: arithmetic_unweighted_forward_backward(x),
+        lambda: arithmetic_unweighted_forward_backward_transpose(x),
         lambda: jax_arithmetic_unweighted_forward_backward(x),
         args.warmup,
         args.iterations,
@@ -724,8 +786,16 @@ def main() -> None:
         jax_label="JAX segment",
     )
     _benchmark_pair(
+        "single log-sum-exp forward + backward (scatter)",
+        lambda: logsumexp_unweighted_forward_backward_scatter(x),
+        lambda: jax_logsumexp_unweighted_forward_backward(x),
+        args.warmup,
+        args.iterations,
+        jax_label="JAX segment",
+    )
+    _benchmark_pair(
         "single log-sum-exp forward + backward (transpose)",
-        lambda: logsumexp_unweighted_forward_backward(x),
+        lambda: logsumexp_unweighted_forward_backward_transpose(x),
         lambda: jax_logsumexp_unweighted_forward_backward(x),
         args.warmup,
         args.iterations,
@@ -740,8 +810,20 @@ def main() -> None:
         jax_label="JAX segment",
     )
     _benchmark_pair(
+        f"batched arithmetic forward + backward (scatter, batch={args.batch_size})",
+        lambda: batched_arithmetic_unweighted_forward_backward_scatter(
+            x_batch
+        ),
+        lambda: batched_jax_arithmetic_unweighted_forward_backward(x_batch),
+        args.warmup,
+        args.iterations,
+        jax_label="JAX segment",
+    )
+    _benchmark_pair(
         f"batched arithmetic forward + backward (transpose, batch={args.batch_size})",
-        lambda: batched_arithmetic_unweighted_forward_backward(x_batch),
+        lambda: batched_arithmetic_unweighted_forward_backward_transpose(
+            x_batch
+        ),
         lambda: batched_jax_arithmetic_unweighted_forward_backward(x_batch),
         args.warmup,
         args.iterations,
@@ -756,8 +838,20 @@ def main() -> None:
         jax_label="JAX segment",
     )
     _benchmark_pair(
+        f"batched log-sum-exp forward + backward (scatter, batch={args.batch_size})",
+        lambda: batched_logsumexp_unweighted_forward_backward_scatter(
+            x_batch
+        ),
+        lambda: batched_jax_logsumexp_unweighted_forward_backward(x_batch),
+        args.warmup,
+        args.iterations,
+        jax_label="JAX segment",
+    )
+    _benchmark_pair(
         f"batched log-sum-exp forward + backward (transpose, batch={args.batch_size})",
-        lambda: batched_logsumexp_unweighted_forward_backward(x_batch),
+        lambda: batched_logsumexp_unweighted_forward_backward_transpose(
+            x_batch
+        ),
         lambda: batched_jax_logsumexp_unweighted_forward_backward(x_batch),
         args.warmup,
         args.iterations,

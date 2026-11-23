@@ -27,6 +27,15 @@ cudaError_t csr_logsumexp_jvp(
     const float* output, const float* input_tangent, float* output_tangent,
     CsrKernelOptions options, cudaStream_t stream = nullptr) noexcept;
 
+/** Compute batched JVPs of unweighted log-sum-exp CSR products. */
+cudaError_t csr_logsumexp_jvp_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices, const float* log_x,
+    const float* output, const float* input_tangent,
+    float* output_tangent, CsrKernelOptions options,
+    cudaStream_t stream = nullptr) noexcept;
+
 /** Compute the JVP of a weighted log-sum-exp CSR product. */
 cudaError_t csr_logsumexp_jvp(
     std::int32_t num_rows, const std::int32_t* row_offsets,
@@ -37,6 +46,17 @@ cudaError_t csr_logsumexp_jvp(
 
 /** Compute the input VJP of an unweighted log-sum-exp CSR product. */
 cudaError_t csr_logsumexp_input_vjp(
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices,
+    const std::int32_t* transpose_row_offsets,
+    const std::int32_t* transpose_column_indices, const float* log_x,
+    const float* output, const float* output_cotangent,
+    float* input_cotangent, CsrKernelOptions transpose_options,
+    cudaStream_t stream = nullptr) noexcept;
+
+/** Compute batched unweighted input VJPs using transposed CSR. */
+cudaError_t csr_logsumexp_input_vjp_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
     std::int32_t num_columns, const std::int32_t* row_offsets,
     const std::int32_t* column_indices,
     const std::int32_t* transpose_row_offsets,
@@ -70,6 +90,24 @@ cudaError_t csr_logsumexp_input_vjp_scatter(
     const float* log_x, const float* output,
     const float* output_cotangent, float* input_cotangent,
     CsrKernelOptions options, cudaStream_t stream = nullptr) noexcept;
+
+/** Compute an unweighted input VJP by scattering original CSR edges. */
+cudaError_t csr_logsumexp_input_vjp_scatter(
+    std::int32_t num_rows, std::int32_t num_columns,
+    const std::int32_t* row_offsets,
+    const std::int32_t* column_indices, const float* log_x,
+    const float* output, const float* output_cotangent,
+    float* input_cotangent, CsrKernelOptions options,
+    cudaStream_t stream = nullptr) noexcept;
+
+/** Compute batched unweighted input VJPs by atomic scatter. */
+cudaError_t csr_logsumexp_input_vjp_scatter_batched(
+    std::int32_t batch_size, std::int32_t num_rows,
+    std::int32_t num_columns, const std::int32_t* row_offsets,
+    const std::int32_t* column_indices, const float* log_x,
+    const float* output, const float* output_cotangent,
+    float* input_cotangent, CsrKernelOptions options,
+    cudaStream_t stream = nullptr) noexcept;
 
 /** Compute the edge-log-value VJP of a weighted log-sum-exp product. */
 cudaError_t csr_logsumexp_values_vjp(

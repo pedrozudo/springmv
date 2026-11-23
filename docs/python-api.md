@@ -65,6 +65,11 @@ minimum = csr_minplus(structure, x, edge_values=edge_values)
 maximum = csr_maxplus(structure, x, edge_values=edge_values)
 ```
 
+These calls use a valued (weighted) CSR matrix: each stored entry has an
+explicit `float32` value. A binary (unweighted) CSR matrix stores only the
+sparsity structure and treats every present entry as the multiplicative
+identity of the selected semiring.
+
 The value argument is optional in every case:
 
 ```python

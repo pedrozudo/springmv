@@ -5,7 +5,13 @@ standard sparse matrix-vector multiplication from the arithmetic semiring to
 other useful semirings. SpringMV currently includes the standard arithmetic,
 log-sum-exp, min-plus, and max-plus semirings in weighted and unweighted form.
 
-| Operation | Weighted reduction | Unweighted reduction |
+The CSR matrix can be either binary or valued. In the binary (unweighted)
+form, only the sparsity structure is stored and every present entry uses the
+semiring's multiplicative identity. In the valued (weighted) form, every
+stored entry has an explicit `float32` value that participates in the
+reduction.
+
+| Operation | Valued/weighted CSR | Binary/unweighted CSR |
 |---|---|---|
 | Arithmetic | `sum(values * x)` | `sum(x)` |
 | Log-sum-exp | `logsumexp(log_values + log_x)` | `logsumexp(log_x)` |

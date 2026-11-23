@@ -1,15 +1,11 @@
 # SpringMV
 
-SpringMV stands for **Sparse Semiring Matrix-Vector multiplies**. It generalizes
+SpringMV stands for **Sparse Semiring Matrix-Vector** multiplication. It generalizes
 standard sparse matrix-vector multiplication from the arithmetic semiring to
 other useful semirings. SpringMV currently includes the standard arithmetic,
 log-sum-exp, min-plus, and max-plus semirings.
-
-The CSR matrix can be either binary or valued. In the binary (unweighted)
-form, only the sparsity structure is stored and every present entry uses the
-semiring's multiplicative identity. In the valued (weighted) form, every
-stored entry has an explicit `float32` value that participates in the
-reduction.
+Matrices a represented in CSR format and can be either binary or valued. In the binary (unweighted) form, only the sparsity structure is stored. In the valued (weighted) form, every stored entry has an explicit `float32` value that participates in the
+matrix-vector multiply.
 
 | Operation | Valued/weighted CSR | Binary/unweighted CSR |
 |---|---|---|
